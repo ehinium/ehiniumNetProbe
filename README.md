@@ -6,20 +6,21 @@ Language switch:
 
 # ehiniumNetProbe
 
-**Language**
-- [English](#english)
-- [فارسی](#فارسی)
+[English](#about) | [فارسی](#درباره)
 
 ---
 
-## English
+## About
 
-### ehiniumNetProbe
+ehiniumNetProbe is a lightweight network diagnostic tool focused on testing real connectivity between two servers.
 
-A small interactive network diagnostic script for Linux servers.
-It checks ICMP ping, TCP connect, TCP/UDP echo, TLS handshake, iperf3 throughput, and TCP/TLS soak stability.
+Instead of checking a single protocol in isolation, it verifies whether actual packets can be exchanged end-to-end over different transport layers (ICMP, TCP, UDP, and TLS). This makes it possible to see which protocols work, which partially work, and which are blocked or unstable between two points.
 
-Status: **beta (0.1.9)**  
+By combining basic reachability tests, throughput measurements, and long-running stability (soak) checks, the tool helps identify:
+- whether TCP or UDP traffic is allowed
+- whether TLS handshakes succeed reliably
+- whether connections degrade or drop after repeated use
+- which types of tunnels or encapsulations are likely to work between the two servers
 
 ---
 
@@ -37,20 +38,20 @@ Status: **beta (0.1.9)**
 
 ### Requirements
 
-Server mode may use:
+Server:
 - openssl
 - iperf3
 - socat or python3
 - netcat (nc) or python3
 
-Client mode may use:
+Client:
 - ping
 - netcat (nc)
 - openssl
 - iperf3
 - socat or python3
 
-Recommended install (Ubuntu):
+Install (Ubuntu):
 ```bash
 sudo apt update
 sudo apt install -y iperf3 openssl netcat-openbsd socat
@@ -96,17 +97,22 @@ sudo chmod +x /usr/local/bin/ehiniumNetProbe
 ehiniumNetProbe
 ```
 
+
 ---
 
-## فارسی
 
-### ehiniumNetProbe
+## درباره
 
-یک اسکریپت سبک و تعاملی برای تست و عیب‌یابی شبکه روی سرورهای لینوکس.
-این ابزار موارد زیر را بررسی می‌کند:
-Ping (ICMP)، اتصال TCP، Echo در TCP و UDP، هندشیک TLS، تست سرعت iperf3 و تست پایداری (Soak).
 
-وضعیت: **بتا (0.1.9)**  
+ehiniumNetProbe یک ابزار سبک برای عیب‌یابی اتصال شبکه بین دو سرور است.
+
+به‌جای بررسی یک پروتکل به‌صورت تکی، این ابزار بررسی می‌کند که آیا پکت‌های واقعی می‌توانند به‌صورت end-to-end بین دو سرور رد و بدل شوند یا نه. به این شکل می‌توان مشخص کرد که کدام پروتکل‌ها کار می‌کنند، کدام‌ها به‌صورت ناقص کار می‌کنند، و کدام‌ها مسدود یا ناپایدار هستند.
+
+با ترکیب تست‌های پایه اتصال، اندازه‌گیری سرعت، و تست‌های پایداری بلندمدت (Soak)، این ابزار کمک می‌کند بفهمیم:
+- آیا ترافیک TCP یا UDP اجازه عبور دارد یا نه
+- آیا هندشیک TLS به‌صورت پایدار انجام می‌شود
+- آیا اتصال بعد از چند بار استفاده دچار افت یا قطع می‌شود 
+- چه نوع تونل‌ها یا روش‌های انتقال احتمالا بین این دو سرور قابل استفاده هستند 
 
 ---
 
@@ -124,20 +130,20 @@ Ping (ICMP)، اتصال TCP، Echo در TCP و UDP، هندشیک TLS، تست 
 
 ### پیش‌نیازها
 
-در حالت Server ممکن است نیاز باشد:
+در حالت Server:
 - openssl
 - iperf3
 - socat یا python3
 - netcat (nc) یا python3
 
-در حالت Client ممکن است نیاز باشد:
+در حالت Client:
 - ping
 - netcat (nc)
 - openssl
 - iperf3
 - socat یا python3
 
-نصب پیشنهادی در اوبونتو:
+نصب در اوبونتو:
 ```bash
 sudo apt update
 sudo apt install -y iperf3 openssl netcat-openbsd socat python3
