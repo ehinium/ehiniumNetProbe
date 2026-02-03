@@ -146,7 +146,7 @@ ehiniumNetProbe یک ابزار سبک برای عیب‌یابی اتصال ش�
 نصب در اوبونتو:
 ```bash
 sudo apt update
-sudo apt install -y iperf3 openssl netcat-openbsd socat python3
+sudo apt install -y iperf3 openssl netcat-openbsd socat
 ```
 
 ---
