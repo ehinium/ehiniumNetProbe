@@ -1,8 +1,7 @@
-@ -0,0 +1,908 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.1.9"
+VERSION="0.2.0"
 
 # -----------------------------
 # Styling
@@ -123,8 +122,12 @@ run_with_spinner() {
   done
 
   set +e
+  # wait can return non-zero when the wrapped command fails.
+  # We want to capture rc and let caller handle it, not trip the global ERR trap.
+  trap - ERR
   wait "$pid"
   local rc=$?
+  trap 'cleanup; err "Unexpected error on line $LINENO"; exit 1' ERR
   set -e
 
   now=$(date +%s)
@@ -517,6 +520,25 @@ test_udp_echo() {
   add_row "udp_echo" "$(warn)" "$(translate_missing socat "apt install socat (or install python3)")"
 }
 
+extract_iperf_errline() {
+  # returns first meaningful iperf error line (or empty)
+  local errf="${1:-}" outf="${2:-}"
+  local msg=""
+  set +e
+  trap - ERR
+  msg="$(grep -iE -m1 "server is busy|busy running a test|unable to send control message|control socket|refused|timed out|no route|error|failed" \
+        ${errf:+ "$errf"} ${outf:+ "$outf"} 2>/dev/null || true)"
+  trap 'cleanup; err "Unexpected error on line $LINENO"; exit 1' ERR
+  set -e
+  printf "%s" "$msg"
+}
+
+is_iperf_busy() {
+  local msg="$1"
+  [[ "$msg" == *"server is busy"* ]] || [[ "$msg" == *"busy running a test"* ]]
+}
+
+
 test_tls_handshake() {
   if ! have openssl; then
     add_row "tls_handshake" "$(warn)" "$(translate_missing openssl "apt install openssl")"
@@ -551,35 +573,85 @@ iperf_is_zero() {
   return 1
 }
 
+to_kbits() {
+  # $1 value, $2 unit -> prints kbits/sec as number (can be float)
+  awk -v v="$1" -v u="$2" 'BEGIN{
+    if (u=="bits/sec")  printf "%.3f", v/1000.0;
+    else if (u=="Kbits/sec") printf "%.3f", v;
+    else if (u=="Mbits/sec") printf "%.3f", v*1000.0;
+    else if (u=="Gbits/sec") printf "%.3f", v*1000.0*1000.0;
+    else printf "";
+  }'
+}
+
 test_iperf_tcp() {
   if ! have iperf3; then
     add_row "iperf3_tcp" "$(warn)" "$(translate_missing iperf3 "apt install iperf3")"
     return
   fi
-  run_with_spinner "iperf3_tcp" timeout $((IPERF_TIME + 5)) iperf3 -c "$HOST" -p "$IPERF_PORT" -t "$IPERF_TIME" -P "$IPERF_PARALLEL"
-  local rc=$?
+
+  local rc=0
+  local used_fallback=""
+  local timeout_s=$((IPERF_TIME + 10))
+
+  # Attempt 1: use configured parallel
+  if run_with_spinner "iperf3_tcp" timeout "$timeout_s" iperf3 -c "$HOST" -p "$IPERF_PORT" -t "$IPERF_TIME" -P "$IPERF_PARALLEL"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  # If failed and parallel is not 1, retry once with P=1
+  if [[ "$rc" -ne 0 && "${IPERF_PARALLEL:-1}" -ne 1 ]]; then
+    used_fallback="fallback P=1"
+    if run_with_spinner "iperf3_tcp" timeout "$timeout_s" iperf3 -c "$HOST" -p "$IPERF_PORT" -t "$IPERF_TIME" -P 1; then
+      rc=0
+    else
+      rc=$?
+    fi
+  fi
 
   if [[ "$rc" -ne 0 ]]; then
-    local msg
-    msg=$(grep -iE -m1 "unable|refused|timed out|no route|error|failed" "$RUN_ERR_FILE" "$RUN_OUT_FILE" 2>/dev/null | head -n1 || true)
-    [[ -z "$msg" ]] && msg="iperf3 failed"
+    local msg=""
+    msg="$(extract_iperf_errline "${RUN_ERR_FILE:-}" "${RUN_OUT_FILE:-}")"
+    [[ -z "$msg" ]] && msg="iperf3 failed (rc=$rc)"
+    [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
     add_row "iperf3_tcp" "$(bad)" "$msg"
     return
   fi
 
   local rx; rx=$(parse_iperf_receiver "$RUN_OUT_FILE" || true)
   if [[ -z "$rx" ]]; then
-    add_row "iperf3_tcp" "$(bad)" "receiver line missing"
+    local msg="receiver line missing"
+    [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
+    add_row "iperf3_tcp" "$(bad)" "$msg"
     return
   fi
+
   local val unit
   val=$(awk '{print $1}' <<< "$rx")
   unit=$(awk '{print $2}' <<< "$rx")
+
+  # FAIL if exactly zero, WARN if below 1 Mbit/sec (1000 Kbits/sec)
+  local kbps; kbps=$(to_kbits "$val" "$unit" || true)
+
   if awk -v v="$val" 'BEGIN{exit !(v==0)}'; then
-    add_row "iperf3_tcp" "$(bad)" "receiver $rx"
-  else
-    add_row "iperf3_tcp" "$(ok)" "receiver $rx"
+    local msg="receiver $rx"
+    [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
+    add_row "iperf3_tcp" "$(bad)" "$msg"
+    return
   fi
+
+  if [[ -n "$kbps" ]] && awk -v k="$kbps" 'BEGIN{exit !(k<1000)}'; then
+    local msg="receiver $rx (< 1 Mbps)"
+    [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
+    add_row "iperf3_tcp" "$(warn)" "$msg"
+    return
+  fi
+
+  local msg="receiver $rx"
+  [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
+  add_row "iperf3_tcp" "$(ok)" "$msg"
 }
 
 test_iperf_udp() {
@@ -587,39 +659,82 @@ test_iperf_udp() {
     add_row "iperf3_udp" "$(warn)" "$(translate_missing iperf3 "apt install iperf3")"
     return
   fi
-  run_with_spinner "iperf3_udp" timeout $((IPERF_TIME + 5)) iperf3 -u -c "$HOST" -p "$IPERF_PORT" -t "$IPERF_TIME" -b "$IPERF_UDP_BW"
-  local rc=$?
+
+  local rc=0
+  local msg=""
+  local used_fallback=""
+  local timeout_s=$((IPERF_TIME + 10))
+
+  local attempt backoff
+  for attempt in 1 2 3 4; do
+    if run_with_spinner "iperf3_udp" timeout "$timeout_s" iperf3 -u -c "$HOST" -p "$IPERF_PORT" -t "$IPERF_TIME" -b "$IPERF_UDP_BW"; then
+      rc=0
+    else
+      rc=$?
+    fi
+
+    msg="$(extract_iperf_errline "${RUN_ERR_FILE:-}" "${RUN_OUT_FILE:-}")"
+
+    if [[ "$rc" -ne 0 ]] && is_iperf_busy "$msg"; then
+      backoff=$((attempt))  # 1s,2s,3s,4s
+      log "iperf3 server busy, retrying in ${backoff}s (attempt ${attempt}/4)"
+      sleep "$backoff"
+      continue
+    fi
+
+    break
+  done
+
+  # If still failed (and not busy), retry once with low bandwidth
+  if [[ "$rc" -ne 0 ]] && ! is_iperf_busy "$msg" && [[ "${IPERF_UDP_BW:-}" != "1M" ]]; then
+    used_fallback="fallback bw=1M"
+    if run_with_spinner "iperf3_udp" timeout "$timeout_s" iperf3 -u -c "$HOST" -p "$IPERF_PORT" -t "$IPERF_TIME" -b 1M; then
+      rc=0
+      msg=""
+    else
+      rc=$?
+      msg="$(extract_iperf_errline "${RUN_ERR_FILE:-}" "${RUN_OUT_FILE:-}")"
+    fi
+  fi
 
   if [[ "$rc" -ne 0 ]]; then
-    local msg
-    msg=$(grep -iE -m1 "unable|refused|timed out|no route|error|failed" "$RUN_ERR_FILE" "$RUN_OUT_FILE" 2>/dev/null | head -n1 || true)
-    [[ -z "$msg" ]] && msg="iperf3 failed"
+    [[ -z "$msg" ]] && msg="iperf3 failed (rc=$rc)"
+    [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
     add_row "iperf3_udp" "$(bad)" "$msg"
     return
   fi
 
   local sum; sum=$(awk '/receiver/ && /%/ {print; exit}' "$RUN_OUT_FILE" || true)
   if [[ -z "$sum" ]]; then
-    add_row "iperf3_udp" "$(bad)" "receiver summary missing"
+    local d="receiver summary missing"
+    [[ -n "$used_fallback" ]] && d="$d ($used_fallback)"
+    add_row "iperf3_udp" "$(bad)" "$d"
     return
   fi
+
   local rate jitter loss pct
   rate=$(awk '{for(i=1;i<=NF;i++) if($i ~ /bits\/sec/) {print $(i-1), $i; exit}}' <<< "$sum")
   jitter=$(awk '{for(i=1;i<=NF;i++) if($i=="ms") {print $(i-1), "ms"; exit}}' <<< "$sum")
-  loss=$(grep -oE '[0-9]+/[0-9]+ \([0-9.]+%\)' <<< "$sum" | head -n1 || true)
-  pct=$(grep -oE '\([0-9.]+%\)' <<< "$loss" | tr -d '()%' || true)
+
+  loss=$(awk 'match($0, /[0-9]+\/[0-9]+ \([0-9.]+%\)/, a){print a[0]; exit}' <<< "$sum")
+  pct=$(awk 'match($0, /\(([0-9.]+)%\)/, a){print a[1]; exit}' <<< "${loss:-}")
 
   if [[ -z "$pct" ]]; then
-    add_row "iperf3_udp" "$(warn)" "$rate, summary incomplete"
+    local d="$rate, summary incomplete"
+    [[ -n "$used_fallback" ]] && d="$d ($used_fallback)"
+    add_row "iperf3_udp" "$(warn)" "$d"
     return
   fi
 
+  local d="$rate, loss $loss, jitter $jitter"
+  [[ -n "$used_fallback" ]] && d="$d ($used_fallback)"
+
   if awk -v p="$pct" 'BEGIN{exit !(p<=1.0)}'; then
-    add_row "iperf3_udp" "$(ok)" "$rate, loss $loss, jitter $jitter"
+    add_row "iperf3_udp" "$(ok)" "$d"
   elif awk -v p="$pct" 'BEGIN{exit !(p<=3.0)}'; then
-    add_row "iperf3_udp" "$(warn)" "$rate, loss $loss, jitter $jitter"
+    add_row "iperf3_udp" "$(warn)" "$d"
   else
-    add_row "iperf3_udp" "$(bad)" "$rate, loss $loss, jitter $jitter"
+    add_row "iperf3_udp" "$(bad)" "$d"
   fi
 }
 
