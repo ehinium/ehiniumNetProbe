@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 
 # -----------------------------
 # Styling
@@ -94,6 +94,118 @@ translate_missing() {
 
 strip_ansi() { sed -r 's/\x1B\[[0-9;]*[mK]//g'; }
 
+normalize_err_line() {
+  # Make error line stable for pattern matching
+  # 1) strip temp file prefix
+  # 2) strip "iperf3:" and "error -"
+  # 3) lowercase
+  # 4) trim
+  printf "%s" "$1" \
+    | sed -E 's|^/tmp/[^:]+:||' \
+    | sed -E 's/^iperf3:[[:space:]]*//I' \
+    | sed -E 's/^[[:space:]]*error[[:space:]]*-[[:space:]]*//I' \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+classify_net_err() {
+  # Input: normalized lowercase line
+  # Output: one of known codes
+  local s="$1"
+
+  [[ -z "$s" ]] && { echo "UNKNOWN"; return; }
+
+  if [[ "$s" == *"name or service not known"* ]] || [[ "$s" == *"temporary failure in name resolution"* ]] || [[ "$s" == *"could not resolve"* ]]; then
+    echo "DNS_FAIL"; return
+  fi
+
+  if [[ "$s" == *"no route to host"* ]] || [[ "$s" == *"network is unreachable"* ]]; then
+    echo "NO_ROUTE"; return
+  fi
+
+  if [[ "$s" == *"connection refused"* ]]; then
+    echo "CONN_REFUSED"; return
+  fi
+
+  if [[ "$s" == *"timed out"* ]] || [[ "$s" == *"timeout"* ]]; then
+    echo "TIMEOUT"; return
+  fi
+
+  if [[ "$s" == *"connection reset by peer"* ]] || [[ "$s" == *"reset by peer"* ]]; then
+    echo "RESET"; return
+  fi
+
+  if [[ "$s" == *"server is busy"* ]] || [[ "$s" == *"busy running a test"* ]]; then
+    echo "IPERF_BUSY"; return
+  fi
+
+  if [[ "$s" == *"unable to send control message"* ]] || [[ "$s" == *"control socket"* ]]; then
+    echo "IPERF_CONTROL"; return
+  fi
+
+  echo "UNKNOWN"
+}
+
+translate_err_code() {
+  # Keep messages short, table-friendly
+  local code="$1"
+  case "$code" in
+    DNS_FAIL)     echo "dns failed (cannot resolve host)" ;;
+    NO_ROUTE)     echo "no route (network unreachable)" ;;
+    CONN_REFUSED) echo "connection refused (port closed/firewall)" ;;
+    TIMEOUT)      echo "timed out (packet loss/shaping/firewall)" ;;
+    RESET)        echo "connection reset (middlebox or server closed)" ;;
+    IPERF_BUSY)   echo "iperf3 busy (another test running)" ;;
+    IPERF_CONTROL) echo "iperf3 control failed (reset/firewall/shaping)" ;;
+    *)            echo "failed (unknown error)" ;;
+  esac
+}
+
+pretty_err() {
+  # Input: raw line
+  # Output: translated text, plus (optional) short raw tail if helpful
+  local raw="$1"
+  local norm code
+  norm="$(normalize_err_line "$raw")"
+  code="$(classify_net_err "$norm")"
+
+  # Translation only:
+  # echo "$(translate_err_code "$code")"
+
+  # Translation + short raw hint (recommended):
+  local hint=""
+  if [[ -n "$norm" ]]; then
+    hint="$(printf "%s" "$norm" | head -c 80)"
+    echo "$(translate_err_code "$code"): $hint"
+  else
+    echo "$(translate_err_code "$code")"
+  fi
+}
+
+ensure_dependencies() {
+  local pkgs=()
+  local need_update=0
+
+  have iperf3  || pkgs+=("iperf3")
+  have openssl || pkgs+=("openssl")
+  have nc      || pkgs+=("netcat-openbsd")
+  have socat   || pkgs+=("socat")
+
+  if (( ${#pkgs[@]} == 0 )); then
+    return 0
+  fi
+
+  if [[ $EUID -ne 0 ]]; then
+    err "Missing dependencies: ${pkgs[*]}"
+    err "Re-run with sudo to auto-install them."
+    exit 1
+  fi
+
+  log "Installing missing dependencies: ${pkgs[*]}"
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y "${pkgs[@]}"
+}
+
 # -----------------------------
 # Spinner wrapper (external commands)
 # -----------------------------
@@ -105,7 +217,15 @@ run_with_spinner() {
   start_ts=$(date +%s)
 
   local out errf
-  out=$(mktemp) ; errf=$(mktemp)
+  set +e
+  out=$(mktemp 2>/dev/null) || true
+  errf=$(mktemp 2>/dev/null) || true
+  set -e
+  if [[ -z "$out" || -z "$errf" || ! -f "$out" || ! -f "$errf" ]]; then
+    RUN_OUT_FILE=""
+    RUN_ERR_FILE=""
+    return 2
+  fi
   TMPFILES+=("$out" "$errf")
 
   set +e
@@ -413,9 +533,9 @@ test_icmp_ping() {
   run_with_spinner "icmp_ping" ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$HOST"
   local rc=$?
 
-  local loss_pct rtt
-  loss_pct=$(extract_ping_loss_pct "$RUN_OUT_FILE" || true)
-  rtt=$(extract_ping_rtt "$RUN_OUT_FILE" || true)
+  local loss_pct="" rtt=""
+  [[ -f "${RUN_OUT_FILE:-}" ]] && loss_pct=$(extract_ping_loss_pct "$RUN_OUT_FILE" 2>/dev/null || true)
+  [[ -f "${RUN_OUT_FILE:-}" ]] && rtt=$(extract_ping_rtt "$RUN_OUT_FILE" 2>/dev/null || true)
   [[ -z "$loss_pct" ]] && loss_pct="n/a"
   [[ -z "$rtt" ]] && rtt="n/a"
 
@@ -469,11 +589,19 @@ test_tcp_echo() {
   local token="ehinium_$(date +%s)_$RANDOM"
   run_with_spinner "tcp_echo" bash -lc "printf '%s\n' '$token' | timeout $CMD_TIMEOUT nc '$HOST' '$TCP_ECHO_PORT' | head -n 1"
   local rc=$?
-  local resp; resp=$(head -n 1 "$RUN_OUT_FILE" | tr -d '\r\n')
+  local resp=""
+  [[ -f "${RUN_OUT_FILE:-}" ]] && resp=$(head -n 1 "$RUN_OUT_FILE" 2>/dev/null | tr -d '\r\n' || true)
   if [[ "$rc" -eq 0 && "$resp" == "$token" ]]; then
     add_row "tcp_echo" "$(ok)" "payload echoed ok"
   else
-    add_row "tcp_echo" "$(bad)" "payload echo failed"
+    local errdetail=""
+    if [[ "$rc" -eq 2 ]]; then
+      errdetail=": internal error (temp file)"
+    elif [[ -f "${RUN_ERR_FILE:-}" ]]; then
+      errdetail=$(head -n 1 "$RUN_ERR_FILE" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 80 || true)
+      [[ -n "$errdetail" ]] && errdetail=": $errdetail"
+    fi
+    add_row "tcp_echo" "$(bad)" "payload echo failed${errdetail}"
   fi
 }
 
@@ -497,22 +625,39 @@ test_udp_echo() {
   if have socat; then
     run_with_spinner "udp_echo" bash -lc "printf '%s' '$token' | timeout $CMD_TIMEOUT socat - UDP:'$HOST':$UDP_ECHO_PORT,connect-timeout=2,readbytes=256 2>/dev/null | head -c ${#token}"
     local rc=$?
-    local resp; resp=$(cat "$RUN_OUT_FILE")
+    local resp=""
+    [[ -f "${RUN_OUT_FILE:-}" ]] && resp=$(cat "$RUN_OUT_FILE" 2>/dev/null || true)
     if [[ "$rc" -eq 0 && "$resp" == "$token" ]]; then
       add_row "udp_echo" "$(ok)" "payload echoed ok"
     else
-      add_row "udp_echo" "$(bad)" "payload echo failed"
+      local errdetail=""
+      if [[ "$rc" -eq 2 ]]; then
+        errdetail=": internal error (temp file)"
+      elif [[ -f "${RUN_ERR_FILE:-}" ]]; then
+        errdetail=$(head -n 1 "$RUN_ERR_FILE" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 80 || true)
+        [[ -n "$errdetail" ]] && errdetail=": $errdetail"
+      fi
+      add_row "udp_echo" "$(bad)" "payload echo failed${errdetail}"
     fi
     return
   fi
 
   if have python3; then
     run_with_spinner "udp_echo" bash -lc "python3 - <<'PY'\nimport socket, sys\nhost='${HOST}'\nport=int('${UDP_ECHO_PORT}')\ntoken='${token}'\ns=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.settimeout(${CMD_TIMEOUT})\ns.sendto(token.encode(), (host, port))\ntry:\n  data,_=s.recvfrom(4096)\n  sys.stdout.write(data.decode(errors='ignore'))\nexcept Exception:\n  pass\nPY\n"
-    local resp; resp=$(cat "$RUN_OUT_FILE")
-    if [[ "$resp" == "$token" ]]; then
+    local rc=$?
+    local resp=""
+    [[ -f "${RUN_OUT_FILE:-}" ]] && resp=$(cat "$RUN_OUT_FILE" 2>/dev/null || true)
+    if [[ "$rc" -eq 0 && "$resp" == "$token" ]]; then
       add_row "udp_echo" "$(ok)" "payload echoed ok"
     else
-      add_row "udp_echo" "$(bad)" "payload echo failed"
+      local errdetail=""
+      if [[ "$rc" -eq 2 ]]; then
+        errdetail=": internal error (temp file)"
+      elif [[ -f "${RUN_ERR_FILE:-}" ]]; then
+        errdetail=$(head -n 1 "$RUN_ERR_FILE" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 80 || true)
+        [[ -n "$errdetail" ]] && errdetail=": $errdetail"
+      fi
+      add_row "udp_echo" "$(bad)" "payload echo failed${errdetail}"
     fi
     return
   fi
@@ -521,15 +666,31 @@ test_udp_echo() {
 }
 
 extract_iperf_errline() {
-  # returns first meaningful iperf error line (or empty)
   local errf="${1:-}" outf="${2:-}"
   local msg=""
+  local files=()
+
+  [[ -n "$errf" && -f "$errf" ]] && files+=("$errf")
+  [[ -n "$outf" && -f "$outf" ]] && files+=("$outf")
+
   set +e
   trap - ERR
-  msg="$(grep -iE -m1 "server is busy|busy running a test|unable to send control message|control socket|refused|timed out|no route|error|failed" \
-        ${errf:+ "$errf"} ${outf:+ "$outf"} 2>/dev/null || true)"
+  if (( ${#files[@]} > 0 )); then
+    msg="$(grep -iE -m1 \
+      "server is busy|busy running a test|unable to send control message|control socket|connection reset|refused|timed out|no route|error|failed" \
+      "${files[@]}" 2>/dev/null || true)"
+  fi
   trap 'cleanup; err "Unexpected error on line $LINENO"; exit 1' ERR
   set -e
+
+  # ---- CLEANUP ----
+  # Remove temp file prefix and tool name noise
+  msg="$(printf "%s" "$msg" \
+    | sed -E 's|^/tmp/[^:]+:||' \
+    | sed -E 's/^iperf3:[[:space:]]*//I' \
+    | sed -E 's/^[[:space:]]*error[[:space:]]*-[[:space:]]*//I' \
+    | sed -E 's/^[[:space:]]+//')"
+
   printf "%s" "$msg"
 }
 
@@ -552,9 +713,16 @@ test_tls_handshake() {
   if [[ "$rc" -eq 0 ]]; then
     add_row "tls_handshake" "$(ok)" "handshake ok"
   else
-    local msg
-    msg=$(grep -iE -m1 "unable|refused|timed out|no route|handshake|alert|error" "$RUN_ERR_FILE" "$RUN_OUT_FILE" 2>/dev/null | head -n1 || true)
-    [[ -z "$msg" ]] && msg="handshake failed"
+    local msg=""
+    local files=()
+    [[ -f "${RUN_ERR_FILE:-}" ]] && files+=("$RUN_ERR_FILE")
+    [[ -f "${RUN_OUT_FILE:-}" ]] && files+=("$RUN_OUT_FILE")
+    if (( ${#files[@]} > 0 )); then
+      msg=$(grep -iE -m1 "unable|refused|timed out|no route|handshake|alert|error|connect" "${files[@]}" 2>/dev/null | head -n1 || true)
+    fi
+    [[ -z "$msg" ]] && msg="handshake failed (exit $rc)"
+    # trim and limit length for table
+    msg=$(printf "%s" "$msg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 120)
     add_row "tls_handshake" "$(bad)" "$msg"
   fi
 }
@@ -612,15 +780,23 @@ test_iperf_tcp() {
   fi
 
   if [[ "$rc" -ne 0 ]]; then
-    local msg=""
-    msg="$(extract_iperf_errline "${RUN_ERR_FILE:-}" "${RUN_OUT_FILE:-}")"
-    [[ -z "$msg" ]] && msg="iperf3 failed (rc=$rc)"
+    local raw=""
+    [[ "$rc" -eq 2 ]] && raw="internal error (temp file)"
+    [[ -z "$raw" ]] && raw="$(extract_iperf_errline "${RUN_ERR_FILE:-}" "${RUN_OUT_FILE:-}")"
+    [[ -z "$raw" ]] && raw="iperf3 failed (rc=$rc)"
+    local msg
+    if [[ "$rc" -eq 124 ]]; then
+      msg="iperf3 timed out (network stalled under load)"
+    else
+      msg="$(pretty_err "$raw")"
+    fi
     [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
     add_row "iperf3_tcp" "$(bad)" "$msg"
     return
   fi
 
-  local rx; rx=$(parse_iperf_receiver "$RUN_OUT_FILE" || true)
+  local rx=""
+  [[ -f "${RUN_OUT_FILE:-}" ]] && rx=$(parse_iperf_receiver "$RUN_OUT_FILE" 2>/dev/null || true)
   if [[ -z "$rx" ]]; then
     local msg="receiver line missing"
     [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
@@ -698,13 +874,25 @@ test_iperf_udp() {
   fi
 
   if [[ "$rc" -ne 0 ]]; then
-    [[ -z "$msg" ]] && msg="iperf3 failed (rc=$rc)"
-    [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
-    add_row "iperf3_udp" "$(bad)" "$msg"
+    local raw=""
+    [[ "$rc" -eq 2 ]] && raw="internal error (temp file)"
+    [[ -z "$raw" ]] && raw="$msg"
+    [[ -z "$raw" ]] && raw="iperf3 failed (rc=$rc)"
+
+    local outmsg
+    if [[ "$rc" -eq 124 ]]; then
+      outmsg="iperf3 timed out (network stalled under load)"
+    else
+      outmsg="$(pretty_err "$raw")"
+    fi
+
+    [[ -n "$used_fallback" ]] && outmsg="$outmsg ($used_fallback)"
+    add_row "iperf3_udp" "$(bad)" "$outmsg"
     return
   fi
 
-  local sum; sum=$(awk '/receiver/ && /%/ {print; exit}' "$RUN_OUT_FILE" || true)
+  local sum=""
+  [[ -f "${RUN_OUT_FILE:-}" ]] && sum=$(awk '/receiver/ && /%/ {print; exit}' "$RUN_OUT_FILE" 2>/dev/null || true)
   if [[ -z "$sum" ]]; then
     local d="receiver summary missing"
     [[ -n "$used_fallback" ]] && d="$d ($used_fallback)"
@@ -798,32 +986,34 @@ run_suite_client_single_host() {
   reset_table
   show_params
 
+  # Run each test so one failure never stops the suite; errors are shown in result details.
+  run_one() { "$@" || true; }
   case "$SUITE" in
     express)
-      test_icmp_ping
-      test_tcp_connect
-      test_tcp_echo
-      test_udp_echo
-      test_tls_handshake
-      test_iperf_tcp
-      test_iperf_udp
-      test_tcp_soak
-      test_tls_soak
+      run_one test_icmp_ping
+      run_one test_tcp_connect
+      run_one test_tcp_echo
+      run_one test_udp_echo
+      run_one test_tls_handshake
+      run_one test_iperf_tcp
+      run_one test_iperf_udp
+      run_one test_tcp_soak
+      run_one test_tls_soak
       ;;
     baseline)
-      test_icmp_ping
-      test_tcp_connect
-      test_tcp_echo
-      test_udp_echo
-      test_tls_handshake
+      run_one test_icmp_ping
+      run_one test_tcp_connect
+      run_one test_tcp_echo
+      run_one test_udp_echo
+      run_one test_tls_handshake
       ;;
     throughput)
-      test_iperf_tcp
-      test_iperf_udp
+      run_one test_iperf_tcp
+      run_one test_iperf_udp
       ;;
     soak)
-      test_tcp_soak
-      test_tls_soak
+      run_one test_tcp_soak
+      run_one test_tls_soak
       ;;
     custom)
       prompt_choice "Select tests to run:" \
@@ -991,6 +1181,12 @@ EOF
 }
 
 parse_args() {
+  # Skip dependency install for help
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage; exit 0
+  fi
+
+  ensure_dependencies
   if [[ $# -eq 0 ]]; then wizard_loop; exit 0; fi
   if [[ "${1:-}" == "--interactive" || "${1:-}" == "-i" ]]; then wizard_loop; exit 0; fi
 
