@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.2.1"
+VERSION="0.3.0"
 
 # -----------------------------
 # Styling
@@ -53,6 +53,9 @@ CMD_TIMEOUT=8
 IPERF_TIME=5
 IPERF_PARALLEL=4
 IPERF_UDP_BW="15M"
+# Server-side iperf3 watchdog timeout (seconds).
+# Default: slightly longer than client iperf timeout (IPERF_TIME + 15)
+SERVER_IPERF_TIMEOUT=$((IPERF_TIME + 15))
 
 SOAK_LOOPS=20
 SOAK_INTERVAL=0.10
@@ -402,6 +405,7 @@ show_params() {
   printf "%s\n" "${C_DIM}- ping:  count=$PING_COUNT timeout=${PING_TIMEOUT}s${C_RESET}"
   printf "%s\n" "${C_DIM}- tcp connect: tries=$TCP_CONNECT_TRIES timeout=${TCP_CONNECT_TIMEOUT}s${C_RESET}"
   printf "%s\n" "${C_DIM}- iperf3: time=${IPERF_TIME}s parallel=$IPERF_PARALLEL udp_bw=$IPERF_UDP_BW${C_RESET}"
+  printf "%s\n" "${C_DIM}- iperf3 server: timeout=${SERVER_IPERF_TIMEOUT}s${C_RESET}"
   printf "%s\n" "${C_DIM}- soak: loops=$SOAK_LOOPS interval=${SOAK_INTERVAL}s timeout=${SOAK_TIMEOUT}s${C_RESET}"
 }
 
@@ -482,7 +486,28 @@ start_tls_server() {
 
 start_iperf_server() {
   if ! have iperf3; then return 1; fi
-  iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
+  # If the system lacks the coreutils timeout(1), fall back to a
+  # simple always-on server (no watchdog) and warn once.
+  if ! have timeout; then
+    err "timeout(1) not found; iperf3 watchdog disabled, running iperf3 -s without timeout."
+    iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
+    PIDS+=("$!")
+    return 0
+  fi
+
+  log "iperf3 watchdog enabled: one-test mode (-1), timeout=${SERVER_IPERF_TIMEOUT}s, port=$IPERF_PORT"
+
+  # Watchdog loop: each child iperf3 handles a single test (-1) and is
+  # wrapped in timeout(1) so a stalled client can never keep the server
+  # process (and port) busy forever. The outer loop is tracked via PIDS[]
+  # and will be killed cleanly on Ctrl+C via cleanup().
+  (
+    set +e
+    while true; do
+      timeout "$SERVER_IPERF_TIMEOUT" iperf3 -s -1 -p "$IPERF_PORT" >/dev/null 2>&1
+      sleep 0.2
+    done
+  ) &
   PIDS+=("$!")
   return 0
 }
@@ -996,6 +1021,9 @@ run_suite_client_single_host() {
       run_one test_udp_echo
       run_one test_tls_handshake
       run_one test_iperf_tcp
+      # Small gap to let iperf3 server fully tear down and watchdog
+      # spin up a fresh one before switching from TCP to UDP.
+      sleep 1 || true
       run_one test_iperf_udp
       run_one test_tcp_soak
       run_one test_tls_soak
@@ -1009,6 +1037,9 @@ run_suite_client_single_host() {
       ;;
     throughput)
       run_one test_iperf_tcp
+      # Same small delay between TCP and UDP when running throughput suite
+      # to avoid transient \"server busy\" from just-finished TCP sessions.
+      sleep 1 || true
       run_one test_iperf_udp
       ;;
     soak)
@@ -1133,6 +1164,7 @@ wizard_loop() {
       prompt_line_default "UDP echo port [$UDP_ECHO_PORT]: " "$UDP_ECHO_PORT"; UDP_ECHO_PORT="$PROMPT_VALUE"
       prompt_line_default "TLS port [$TLS_PORT]: " "$TLS_PORT"; TLS_PORT="$PROMPT_VALUE"
       prompt_line_default "iperf3 port [$IPERF_PORT]: " "$IPERF_PORT"; IPERF_PORT="$PROMPT_VALUE"
+      prompt_line_default "iperf3 server timeout seconds [$SERVER_IPERF_TIMEOUT]: " "$SERVER_IPERF_TIMEOUT"; SERVER_IPERF_TIMEOUT="$PROMPT_VALUE"
       prompt_line_default "Soak loops [$SOAK_LOOPS]: " "$SOAK_LOOPS"; SOAK_LOOPS="$PROMPT_VALUE"
       prompt_line_default "Soak interval seconds [$SOAK_INTERVAL]: " "$SOAK_INTERVAL"; SOAK_INTERVAL="$PROMPT_VALUE"
       prompt_line_default "iperf3 UDP bandwidth [$IPERF_UDP_BW]: " "$IPERF_UDP_BW"; IPERF_UDP_BW="$PROMPT_VALUE"
@@ -1198,6 +1230,7 @@ parse_args() {
       --suite) SUITE="${2:-}"; shift 2 ;;
       --host) HOST="${2:-}"; shift 2 ;;
       --sni)  SNI="${2:-}"; shift 2 ;;
+      --iperf-server-timeout) SERVER_IPERF_TIMEOUT="${2:-}"; shift 2 ;;
       --format) OUTPUT_FORMAT="${2:-terminal}"; shift 2 ;;
       --tsv) TSV_OUT="${2:-}"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
