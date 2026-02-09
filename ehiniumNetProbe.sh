@@ -924,9 +924,76 @@ test_tls_handshake() {
 	fi
 }
 
-parse_iperf_receiver() {
-	# prints: "<value> <unit>" or empty
-	awk '/receiver/ && /bits\/sec/ {print $(NF-2), $(NF-1); exit}' "$1"
+sanitize_iperf_token() {
+	# strips commas and CRLF artifacts
+	printf "%s" "$1" | tr -d '\r,'
+}
+
+parse_tcp_sender_summary() {
+	# prints: "<value> <unit>" from LAST sender summary containing bits/sec
+	awk '
+		/sender/ && /bits\/sec/ {
+			for (i = 1; i <= NF; i++) {
+				if ($i ~ /bits\/sec/) {
+					line = $(i - 1) " " $i
+				}
+			}
+		}
+		END { if (line != "") print line }
+	' "$1"
+}
+
+parse_tcp_receiver_summary() {
+	# prints: "<value> <unit>" from LAST receiver summary containing bits/sec
+	awk '
+		/receiver/ && /bits\/sec/ {
+			for (i = 1; i <= NF; i++) {
+				if ($i ~ /bits\/sec/) {
+					line = $(i - 1) " " $i
+				}
+			}
+		}
+		END { if (line != "") print line }
+	' "$1"
+}
+
+parse_udp_sender_summary_line() {
+	# prints LAST UDP sender summary line (loss/jitter line contains %)
+	awk '/sender/ && /%/ {line=$0} END{if(line!="") print line}' "$1"
+}
+
+parse_udp_receiver_summary_line() {
+	# prints LAST UDP receiver summary line (loss/jitter line contains %)
+	awk '/receiver/ && /%/ {line=$0} END{if(line!="") print line}' "$1"
+}
+
+parse_iperf_rate_pair() {
+	# $1 summary line -> "<value> <unit>" or empty
+	awk '
+		{
+			for (i = 1; i <= NF; i++) {
+				if ($i ~ /bits\/sec/) {
+					print $(i - 1), $i
+					exit
+				}
+			}
+		}
+	' <<<"$1"
+}
+
+parse_udp_loss_pair() {
+	# $1 summary line -> "x/y" or empty
+	awk 'match($0, /[0-9]+\/[0-9]+/, a){print a[0]; exit}' <<<"$1"
+}
+
+parse_udp_loss_pct() {
+	# $1 summary line -> "p" (without %) or empty
+	awk 'match($0, /\(([0-9.]+)%\)/, a){print a[1]; exit}' <<<"$1"
+}
+
+parse_udp_jitter() {
+	# $1 summary line -> "<value> ms" or empty
+	awk '{for(i=1;i<=NF;i++) if($i=="ms") {print $(i-1), "ms"; exit}}' <<<"$1"
 }
 
 iperf_is_zero() {
@@ -940,7 +1007,12 @@ iperf_is_zero() {
 
 to_kbits() {
 	# $1 value, $2 unit -> prints kbits/sec as number (can be float)
-	awk -v v="$1" -v u="$2" 'BEGIN{
+	local v u
+	v="$(sanitize_iperf_token "$1")"
+	u="$(sanitize_iperf_token "$2")"
+	awk -v v="$v" -v u="$u" 'BEGIN{
+    if (v=="" || u=="") {printf ""; exit}
+    if (v !~ /^([0-9]+(\.[0-9]+)?|\.[0-9]+)$/) {printf ""; exit}
     if (u=="bits/sec")  printf "%.3f", v/1000.0;
     else if (u=="Kbits/sec") printf "%.3f", v;
     else if (u=="Mbits/sec") printf "%.3f", v*1000.0;
@@ -995,7 +1067,8 @@ test_iperf_tcp() {
 	local attempts=$((${#IPERF_PORTS[@]} * 2))
 	local attempt portinfo port idx rc raw norm code
 	local used_fallback=""
-	local val unit kbps
+	local tx rx tx_val tx_unit rx_val rx_unit tx_kbps rx_kbps metric metric_val metric_unit detail
+	local tx_valid rx_valid fallback_used=0
 	local last_idx=-1
 
 	for ((attempt = 1; attempt <= attempts; attempt++)); do
@@ -1025,27 +1098,35 @@ test_iperf_tcp() {
 			return
 		fi
 
-		local rx=""
-		[[ -f "${RUN_OUT_FILE:-}" ]] && rx=$(parse_iperf_receiver "$RUN_OUT_FILE" 2>/dev/null || true)
-
-		# If iperf produced no receiver summary, treat it like 0 throughput so fallback can run.
-		if [[ -z "$rx" ]]; then
-			val=0
-			unit="bits/sec"
-		else
-			val=$(awk '{print $1}' <<<"$rx")
-			unit=$(awk '{print $2}' <<<"$rx")
+		tx=""
+		rx=""
+		if [[ -f "${RUN_OUT_FILE:-}" ]]; then
+			tx=$(parse_tcp_sender_summary "$RUN_OUT_FILE" 2>/dev/null || true)
+			rx=$(parse_tcp_receiver_summary "$RUN_OUT_FILE" 2>/dev/null || true)
 		fi
 
-		if awk -v v="$val" 'BEGIN{exit !(v==0)}'; then
+		tx_val="$(sanitize_iperf_token "$(awk '{print $1}' <<<"${tx:-}")")"
+		tx_unit="$(sanitize_iperf_token "$(awk '{print $2}' <<<"${tx:-}")")"
+		rx_val="$(sanitize_iperf_token "$(awk '{print $1}' <<<"${rx:-}")")"
+		rx_unit="$(sanitize_iperf_token "$(awk '{print $2}' <<<"${rx:-}")")"
+
+		tx_kbps="$(to_kbits "$tx_val" "$tx_unit" || true)"
+		rx_kbps="$(to_kbits "$rx_val" "$rx_unit" || true)"
+		tx_valid=0
+		rx_valid=0
+		[[ -n "$tx_kbps" ]] && awk -v k="$tx_kbps" 'BEGIN{exit !(k>0)}' && tx_valid=1
+		[[ -n "$rx_kbps" ]] && awk -v k="$rx_kbps" 'BEGIN{exit !(k>0)}' && rx_valid=1
+
+		if [[ "$tx_valid" -eq 0 && "$rx_valid" -eq 0 ]]; then
 			portinfo="$(get_next_iperf_port "$last_idx")" || {
-				add_row "iperf3_tcp" "$(bad)" "receiver $rx"
+				add_row "iperf3_tcp" "$(bad)" "no sender/receiver summary"
 				return
 			}
 			port="${portinfo%%:*}"
 			idx="${portinfo##*:}"
 			last_idx="$idx"
-			used_fallback="fallback P=${IPERF_TCP_FALLBACK_PARALLEL}"
+			used_fallback="fallback P=1"
+			fallback_used=1
 
 			if run_iperf_client_on_port "iperf3_tcp" "$timeout_s" "$port" -t "$IPERF_TCP_TIME" -P "$IPERF_TCP_FALLBACK_PARALLEL" "${rev_arg[@]}"; then
 				rc=0
@@ -1058,25 +1139,53 @@ test_iperf_tcp() {
 				return
 			fi
 
+			tx=""
 			rx=""
-			[[ -f "${RUN_OUT_FILE:-}" ]] && rx=$(parse_iperf_receiver "$RUN_OUT_FILE" 2>/dev/null || true)
-			[[ -n "$rx" ]] || {
-				add_row "iperf3_tcp" "$(bad)" "TCP connected, but no data transferred ($used_fallback)"
+			if [[ -f "${RUN_OUT_FILE:-}" ]]; then
+				tx=$(parse_tcp_sender_summary "$RUN_OUT_FILE" 2>/dev/null || true)
+				rx=$(parse_tcp_receiver_summary "$RUN_OUT_FILE" 2>/dev/null || true)
+			fi
+			tx_val="$(sanitize_iperf_token "$(awk '{print $1}' <<<"${tx:-}")")"
+			tx_unit="$(sanitize_iperf_token "$(awk '{print $2}' <<<"${tx:-}")")"
+			rx_val="$(sanitize_iperf_token "$(awk '{print $1}' <<<"${rx:-}")")"
+			rx_unit="$(sanitize_iperf_token "$(awk '{print $2}' <<<"${rx:-}")")"
+			tx_kbps="$(to_kbits "$tx_val" "$tx_unit" || true)"
+			rx_kbps="$(to_kbits "$rx_val" "$rx_unit" || true)"
+			tx_valid=0
+			rx_valid=0
+			[[ -n "$tx_kbps" ]] && awk -v k="$tx_kbps" 'BEGIN{exit !(k>0)}' && tx_valid=1
+			[[ -n "$rx_kbps" ]] && awk -v k="$rx_kbps" 'BEGIN{exit !(k>0)}' && rx_valid=1
+			if [[ "$tx_valid" -eq 0 && "$rx_valid" -eq 0 ]]; then
+				add_row "iperf3_tcp" "$(bad)" "no sender/receiver summary ($used_fallback)"
 				return
-			}
-			val=$(awk '{print $1}' <<<"$rx")
-			unit=$(awk '{print $2}' <<<"$rx")
-			awk -v v="$val" 'BEGIN{exit !(v==0)}' && {
-				add_row "iperf3_tcp" "$(bad)" "receiver $rx ($used_fallback)"
-				return
-			}
+			fi
 		fi
 
-		kbps=$(to_kbits "$val" "$unit" || true)
-		if [[ -n "$kbps" ]] && awk -v k="$kbps" 'BEGIN{exit !(k<1000)}'; then
-			add_row "iperf3_tcp" "$(warn)" "receiver $rx${used_fallback:+ ($used_fallback)} (< 1 Mbps)"
+		if [[ "$rx_valid" -eq 1 ]]; then
+			metric="receiver"
+			metric_val="$rx_val"
+			metric_unit="$rx_unit"
+			metric="$metric $metric_val $metric_unit"
+			detail="$metric"
 		else
-			add_row "iperf3_tcp" "$(ok)" "receiver $rx${used_fallback:+ ($used_fallback)}"
+			metric="sender"
+			metric_val="$tx_val"
+			metric_unit="$tx_unit"
+			metric="$metric $metric_val $metric_unit"
+			detail="$metric (WARN: receiver stats unavailable)"
+		fi
+
+		local chosen_kbps=""
+		if [[ "$rx_valid" -eq 1 ]]; then
+			chosen_kbps="$rx_kbps"
+		else
+			chosen_kbps="$tx_kbps"
+		fi
+
+		if [[ -n "$chosen_kbps" ]] && awk -v k="$chosen_kbps" 'BEGIN{exit !(k<1000)}'; then
+			add_row "iperf3_tcp" "$(warn)" "$detail${fallback_used:+ (fallback P=1)} (< 1 Mbps)"
+		else
+			add_row "iperf3_tcp" "$(ok)" "$detail${fallback_used:+ (fallback P=1)}"
 		fi
 		return
 	done
@@ -1095,9 +1204,14 @@ test_iperf_udp() {
 
 	local timeout_s=$((IPERF_UDP_TIME + 6))
 	local attempts=$((${#IPERF_PORTS[@]} * 2))
-	local attempt portinfo port idx rc msg raw norm code sum
+	local attempt portinfo port idx rc msg raw norm code
 	local used_fallback=""
+	local fallback_used=0
 	local last_idx=-1
+	local tx_line rx_line tx_rate rx_rate tx_rate_val tx_rate_unit rx_rate_val rx_rate_unit
+	local tx_rate_kbps rx_rate_kbps tx_valid rx_valid
+	local rx_loss_pair tx_loss_pair rx_loss_pct tx_loss_pct loss_pair loss_pct jitter
+	local receiver_invalid
 
 	for ((attempt = 1; attempt <= attempts; attempt++)); do
 		portinfo="$(get_next_iperf_port "$last_idx")" || break
@@ -1121,36 +1235,50 @@ test_iperf_udp() {
 			if is_iperf_rotatable_err "$code"; then
 				continue
 			fi
-
-			if [[ "${IPERF_UDP_BW:-}" != "${IPERF_UDP_FALLBACK_BW:-}" ]]; then
-				used_fallback="fallback bw=${IPERF_UDP_FALLBACK_BW}"
-				if run_iperf_client_on_port "iperf3_udp" "$timeout_s" "$port" -u -t "$IPERF_UDP_TIME" -b "$IPERF_UDP_FALLBACK_BW" "${rev_arg[@]}"; then
-					rc=0
-				else
-					rc=$?
-				fi
-			fi
-
-			if [[ "$rc" -ne 0 ]]; then
-				msg="$(pretty_err "${raw:-iperf3 failed (rc=$rc)}")"
-				add_row "iperf3_udp" "$(bad)" "$msg${used_fallback:+ ($used_fallback)}"
-				return
-			fi
+			msg="$(pretty_err "${raw:-iperf3 failed (rc=$rc)}")"
+			add_row "iperf3_udp" "$(bad)" "$msg"
+			return
 		fi
 
-		sum=""
-		[[ -f "${RUN_OUT_FILE:-}" ]] && sum=$(awk '/receiver/ && /%/ {print; exit}' "$RUN_OUT_FILE" 2>/dev/null || true)
-		if [[ -z "$sum" ]]; then
-			# UDP test did not complete cleanly (no receiver summary). Try fallback bw once, otherwise rotate port.
-			if [[ -z "$used_fallback" && "${IPERF_UDP_BW:-}" != "${IPERF_UDP_FALLBACK_BW:-}" ]]; then
-				used_fallback="fallback bw=${IPERF_UDP_FALLBACK_BW}"
+		tx_line=""
+		rx_line=""
+		if [[ -f "${RUN_OUT_FILE:-}" ]]; then
+			tx_line=$(parse_udp_sender_summary_line "$RUN_OUT_FILE" 2>/dev/null || true)
+			rx_line=$(parse_udp_receiver_summary_line "$RUN_OUT_FILE" 2>/dev/null || true)
+		fi
 
+		tx_rate="$(parse_iperf_rate_pair "$tx_line" || true)"
+		rx_rate="$(parse_iperf_rate_pair "$rx_line" || true)"
+		tx_rate_val="$(sanitize_iperf_token "$(awk '{print $1}' <<<"${tx_rate:-}")")"
+		tx_rate_unit="$(sanitize_iperf_token "$(awk '{print $2}' <<<"${tx_rate:-}")")"
+		rx_rate_val="$(sanitize_iperf_token "$(awk '{print $1}' <<<"${rx_rate:-}")")"
+		rx_rate_unit="$(sanitize_iperf_token "$(awk '{print $2}' <<<"${rx_rate:-}")")"
+		tx_rate_kbps="$(to_kbits "$tx_rate_val" "$tx_rate_unit" || true)"
+		rx_rate_kbps="$(to_kbits "$rx_rate_val" "$rx_rate_unit" || true)"
+		tx_valid=0
+		rx_valid=0
+		[[ -n "$tx_rate_kbps" ]] && awk -v k="$tx_rate_kbps" 'BEGIN{exit !(k>0)}' && tx_valid=1
+		[[ -n "$rx_rate_kbps" ]] && awk -v k="$rx_rate_kbps" 'BEGIN{exit !(k>0)}' && rx_valid=1
+
+		rx_loss_pair="$(parse_udp_loss_pair "$rx_line" || true)"
+		tx_loss_pair="$(parse_udp_loss_pair "$tx_line" || true)"
+		rx_loss_pct="$(sanitize_iperf_token "$(parse_udp_loss_pct "$rx_line" || true)")"
+		tx_loss_pct="$(sanitize_iperf_token "$(parse_udp_loss_pct "$tx_line" || true)")"
+
+		receiver_invalid=0
+		if [[ -n "$rx_line" ]] && [[ "$rx_valid" -eq 0 ]] && [[ -n "$rx_loss_pair" ]] && [[ "$rx_loss_pair" == "0/0" ]]; then
+			receiver_invalid=1
+		fi
+
+		if [[ "$tx_valid" -eq 0 && "$rx_valid" -eq 0 ]]; then
+			if [[ "$fallback_used" -eq 0 && "${IPERF_UDP_BW:-}" != "${IPERF_UDP_FALLBACK_BW:-}" ]]; then
+				used_fallback="fallback bw=1M"
+				fallback_used=1
 				if run_iperf_client_on_port "iperf3_udp" "$timeout_s" "$port" -u -t "$IPERF_UDP_TIME" -b "$IPERF_UDP_FALLBACK_BW" "${rev_arg[@]}"; then
 					rc=0
 				else
 					rc=$?
 				fi
-
 				if [[ "$rc" -ne 0 ]]; then
 					if [[ "$rc" -eq 124 ]]; then
 						continue
@@ -1166,55 +1294,97 @@ test_iperf_udp() {
 					return
 				fi
 
-				# Re-parse after fallback run
-				sum=""
-				[[ -f "${RUN_OUT_FILE:-}" ]] && sum=$(awk '/receiver/ && /%/ {print; exit}' "$RUN_OUT_FILE" 2>/dev/null || true)
-				[[ -n "$sum" ]] || continue
-			else
-				# No fallback available (or already used), rotate port
-				continue
+				tx_line=""
+				rx_line=""
+				if [[ -f "${RUN_OUT_FILE:-}" ]]; then
+					tx_line=$(parse_udp_sender_summary_line "$RUN_OUT_FILE" 2>/dev/null || true)
+					rx_line=$(parse_udp_receiver_summary_line "$RUN_OUT_FILE" 2>/dev/null || true)
+				fi
+				tx_rate="$(parse_iperf_rate_pair "$tx_line" || true)"
+				rx_rate="$(parse_iperf_rate_pair "$rx_line" || true)"
+				tx_rate_val="$(sanitize_iperf_token "$(awk '{print $1}' <<<"${tx_rate:-}")")"
+				tx_rate_unit="$(sanitize_iperf_token "$(awk '{print $2}' <<<"${tx_rate:-}")")"
+				rx_rate_val="$(sanitize_iperf_token "$(awk '{print $1}' <<<"${rx_rate:-}")")"
+				rx_rate_unit="$(sanitize_iperf_token "$(awk '{print $2}' <<<"${rx_rate:-}")")"
+				tx_rate_kbps="$(to_kbits "$tx_rate_val" "$tx_rate_unit" || true)"
+				rx_rate_kbps="$(to_kbits "$rx_rate_val" "$rx_rate_unit" || true)"
+				tx_valid=0
+				rx_valid=0
+				[[ -n "$tx_rate_kbps" ]] && awk -v k="$tx_rate_kbps" 'BEGIN{exit !(k>0)}' && tx_valid=1
+				[[ -n "$rx_rate_kbps" ]] && awk -v k="$rx_rate_kbps" 'BEGIN{exit !(k>0)}' && rx_valid=1
+				rx_loss_pair="$(parse_udp_loss_pair "$rx_line" || true)"
+				tx_loss_pair="$(parse_udp_loss_pair "$tx_line" || true)"
+				rx_loss_pct="$(sanitize_iperf_token "$(parse_udp_loss_pct "$rx_line" || true)")"
+				tx_loss_pct="$(sanitize_iperf_token "$(parse_udp_loss_pct "$tx_line" || true)")"
+				receiver_invalid=0
+				if [[ -n "$rx_line" ]] && [[ "$rx_valid" -eq 0 ]] && [[ -n "$rx_loss_pair" ]] && [[ "$rx_loss_pair" == "0/0" ]]; then
+					receiver_invalid=1
+				fi
 			fi
-		fi
-
-		local rate jitter loss pct
-		rate=$(awk '{for(i=1;i<=NF;i++) if($i ~ /bits\/sec/) {print $(i-1), $i; exit}}' <<<"$sum")
-		jitter=$(awk '{for(i=1;i<=NF;i++) if($i=="ms") {print $(i-1), "ms"; exit}}' <<<"$sum")
-		loss=$(awk 'match($0, /[0-9]+\/[0-9]+ \([0-9.]+%\)/, a){print a[0]; exit}' <<<"$sum")
-		pct=$(awk 'match($0, /\(([0-9.]+)%\)/, a){print a[1]; exit}' <<<"${loss:-}")
-
-		# ---- ZERO-TRAFFIC GUARD ----
-		local rval
-		rval="$(awk '{print $1}' <<<"$rate")"
-
-		# iperf3 can print "0.00 bits/sec, loss 0/0 (0%)" when UDP is blackholed.
-		# Treat 0 bitrate as FAIL, and try fallback bandwidth once.
-		if awk -v v="$rval" 'BEGIN{exit !(v==0)}'; then
-			if [[ -z "$used_fallback" && "$IPERF_UDP_BW" != "$IPERF_UDP_FALLBACK_BW" ]]; then
-				used_fallback="fallback bw=${IPERF_UDP_FALLBACK_BW}"
-				# retry on next port
-				continue
-			else
-				add_row "iperf3_udp" "$(bad)" "receiver $rate, no UDP traffic${used_fallback:+ ($used_fallback)}"
+			if [[ "$tx_valid" -eq 0 && "$rx_valid" -eq 0 ]]; then
+				add_row "iperf3_udp" "$(bad)" "no sender/receiver summary${fallback_used:+ (fallback bw=1M)}"
 				return
 			fi
 		fi
 
-		if [[ -z "$pct" ]]; then
-			add_row "iperf3_udp" "$(warn)" "$rate, summary incomplete${used_fallback:+ ($used_fallback)}"
+		local rate_label rate_str rate_kbps details loss_source
+		if [[ "$rx_valid" -eq 1 && "$receiver_invalid" -eq 0 ]]; then
+			rate_label="receiver"
+			rate_str="$rx_rate_val $rx_rate_unit"
+			rate_kbps="$rx_rate_kbps"
+			details="$rate_str"
+		else
+			rate_label="sender"
+			rate_str="$tx_rate_val $tx_rate_unit"
+			rate_kbps="$tx_rate_kbps"
+			details="$rate_str (WARN: receiver stats unavailable)"
+		fi
+
+		if [[ -n "$rx_loss_pair" ]]; then
+			loss_pair="$rx_loss_pair"
+			loss_pct="$rx_loss_pct"
+			loss_source="receiver"
+		elif [[ -n "$tx_loss_pair" ]]; then
+			loss_pair="$tx_loss_pair"
+			loss_pct="$tx_loss_pct"
+			loss_source="sender"
+		else
+			loss_pair="unknown"
+			loss_pct=""
+			loss_source="unknown"
+		fi
+
+		jitter=""
+		if [[ -n "$rx_line" ]]; then
+			jitter="$(parse_udp_jitter "$rx_line" || true)"
+		fi
+		[[ -n "$jitter" ]] || jitter="$(parse_udp_jitter "$tx_line" || true)"
+		[[ -n "$jitter" ]] || jitter="unknown"
+
+		local d="$details, loss ${loss_pair}${loss_pct:+ (${loss_pct}%)}, jitter $jitter${fallback_used:+ (fallback bw=1M)}"
+		local status
+		status="ok"
+
+		if [[ -n "$loss_pct" ]] && awk -v p="$loss_pct" 'BEGIN{exit !(p==100)}'; then
+			add_row "iperf3_udp" "$(bad)" "$d"
+			return
+		fi
+		if [[ "$tx_valid" -eq 0 && "$rx_valid" -eq 0 ]]; then
+			add_row "iperf3_udp" "$(bad)" "$d"
 			return
 		fi
 
-		local d="$rate, loss $loss, jitter $jitter${used_fallback:+ ($used_fallback)}"
+		if [[ -z "$loss_pct" ]]; then
+			status="warn"
+		elif awk -v p="$loss_pct" 'BEGIN{exit !(p>=3 && p<=99)}'; then
+			status="warn"
+		fi
 
-		# Throughput-based WARN for UDP (non-zero but very low rate)
-		local ukbps
-		ukbps="$(to_kbits "$(awk '{print $1}' <<<"$rate")" "$(awk '{print $2}' <<<"$rate")" || true)"
+		if [[ -n "$rate_kbps" ]] && awk -v k="$rate_kbps" 'BEGIN{exit !(k>0 && k<1000)}'; then
+			status="warn"
+		fi
 
-		# UDP policy:
-		# - PASS only if loss <= 1% AND rate >= 1 Mbps
-		# - WARN for any loss > 1% OR rate < 1 Mbps (but non-zero)
-		# - FAIL is reserved for hard failures handled earlier (no traffic, missing summary after retries, etc.)
-		if awk -v p="$pct" 'BEGIN{exit !(p<=1.0)}' && [[ -n "$ukbps" ]] && awk -v k="$ukbps" 'BEGIN{exit !(k>=1000)}'; then
+		if [[ "$status" == "ok" ]] && [[ -n "$loss_pct" ]] && awk -v p="$loss_pct" 'BEGIN{exit !(p<3)}'; then
 			add_row "iperf3_udp" "$(ok)" "$d"
 		else
 			add_row "iperf3_udp" "$(warn)" "$d"
