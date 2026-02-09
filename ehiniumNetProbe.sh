@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.3.1"
+VERSION="0.4.0"
 
 # -----------------------------
 # Styling
@@ -40,7 +40,10 @@ BIND_ADDR="0.0.0.0"
 TCP_ECHO_PORT=9090
 UDP_ECHO_PORT=9091
 TLS_PORT=9443
-IPERF_PORT=5201
+IPERF_PORT_BASE=5201
+IPERF_PORT_COUNT=8
+IPERF_PORTS_CSV=""
+IPERF_PORTS=()
 
 PING_COUNT=10
 PING_TIMEOUT=1
@@ -50,12 +53,18 @@ TCP_CONNECT_TIMEOUT=2
 
 CMD_TIMEOUT=8
 
-IPERF_TIME=5
-IPERF_PARALLEL=4
+IPERF_TCP_TIME=4
+IPERF_TCP_PARALLEL=4
+IPERF_TCP_FALLBACK_PARALLEL=1
+IPERF_UDP_TIME=5
 IPERF_UDP_BW="15M"
+IPERF_UDP_FALLBACK_BW="1M"
 # Server-side iperf3 watchdog timeout (seconds).
-# Default: slightly longer than client iperf timeout (IPERF_TIME + 15)
-SERVER_IPERF_TIMEOUT=$((IPERF_TIME + 15))
+
+SERVER_IPERF_TIMEOUT=8
+SERVER_IPERF_KILL_TIMEOUT=1
+IPERF_RCV_TIMEOUT_MS=3000
+IPERF_HAS_RCV_TIMEOUT=0
 IPERF_REVERSE=0    # 0 = normal (default), 1 = reverse (-R)
 
 SOAK_LOOPS=20
@@ -89,6 +98,122 @@ trap 'cleanup; exit 0' INT TERM
 trap 'cleanup; err "Unexpected error on line $LINENO"; exit 1' ERR
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+
+apply_env_overrides() {
+  [[ -n "${ENP_IPERF_PORT_BASE:-}" ]] && IPERF_PORT_BASE="$ENP_IPERF_PORT_BASE"
+  [[ -n "${ENP_IPERF_PORT_COUNT:-}" ]] && IPERF_PORT_COUNT="$ENP_IPERF_PORT_COUNT"
+  [[ -n "${ENP_IPERF_PORTS:-}" ]] && IPERF_PORTS_CSV="$ENP_IPERF_PORTS"
+
+  [[ -n "${ENP_IPERF_TCP_PARALLEL:-}" ]] && IPERF_TCP_PARALLEL="$ENP_IPERF_TCP_PARALLEL"
+  [[ -n "${ENP_IPERF_TCP_FALLBACK_PARALLEL:-}" ]] && IPERF_TCP_FALLBACK_PARALLEL="$ENP_IPERF_TCP_FALLBACK_PARALLEL"
+  [[ -n "${ENP_IPERF_TCP_TIME:-}" ]] && IPERF_TCP_TIME="$ENP_IPERF_TCP_TIME"
+
+  [[ -n "${ENP_IPERF_UDP_BW:-}" ]] && IPERF_UDP_BW="$ENP_IPERF_UDP_BW"
+  [[ -n "${ENP_IPERF_UDP_FALLBACK_BW:-}" ]] && IPERF_UDP_FALLBACK_BW="$ENP_IPERF_UDP_FALLBACK_BW"
+  [[ -n "${ENP_IPERF_UDP_TIME:-}" ]] && IPERF_UDP_TIME="$ENP_IPERF_UDP_TIME"
+
+  [[ -n "${ENP_IPERF_SERVER_TIMEOUT:-}" ]] && SERVER_IPERF_TIMEOUT="$ENP_IPERF_SERVER_TIMEOUT"
+  [[ -n "${ENP_IPERF_SERVER_KILL_TIMEOUT:-}" ]] && SERVER_IPERF_KILL_TIMEOUT="$ENP_IPERF_SERVER_KILL_TIMEOUT"
+  [[ -n "${ENP_IPERF_RCV_TIMEOUT_MS:-}" ]] && IPERF_RCV_TIMEOUT_MS="$ENP_IPERF_RCV_TIMEOUT_MS"
+  return 0
+}
+
+setup_iperf_capabilities() {
+  if have iperf3 && iperf3 --help 2>&1 | grep -q -- "--rcv-timeout"; then
+    IPERF_HAS_RCV_TIMEOUT=1
+  else
+    IPERF_HAS_RCV_TIMEOUT=0
+  fi
+}
+
+setup_iperf_ports() {
+  local p item start end
+  IPERF_PORTS=()
+
+  if [[ -n "${IPERF_PORTS_CSV:-}" ]]; then
+    IFS=',' read -r -a _raw_ports <<< "${IPERF_PORTS_CSV// /}"
+    for item in "${_raw_ports[@]}"; do
+      [[ "$item" =~ ^[0-9]+$ ]] || continue
+      (( item >= 1 && item <= 65535 )) || continue
+      IPERF_PORTS+=("$item")
+    done
+  fi
+
+  if (( ${#IPERF_PORTS[@]} == 0 )); then
+    [[ "$IPERF_PORT_BASE" =~ ^[0-9]+$ ]] || IPERF_PORT_BASE=5201
+    [[ "$IPERF_PORT_COUNT" =~ ^[0-9]+$ ]] || IPERF_PORT_COUNT=8
+    (( IPERF_PORT_COUNT > 0 )) || IPERF_PORT_COUNT=8
+    start=$IPERF_PORT_BASE
+    end=$((IPERF_PORT_BASE + IPERF_PORT_COUNT - 1))
+    for ((p=start; p<=end; p++)); do
+      (( p >= 1 && p <= 65535 )) || continue
+      IPERF_PORTS+=("$p")
+    done
+  fi
+
+  if (( ${#IPERF_PORTS[@]} == 0 )); then
+    IPERF_PORTS=(5201 5202 5203 5204 5205 5206 5207 5208)
+  fi
+}
+
+iperf_ports_label() {
+  local first last
+  first="${IPERF_PORTS[0]}"
+  last="${IPERF_PORTS[${#IPERF_PORTS[@]}-1]}"
+  if (( ${#IPERF_PORTS[@]} > 1 )); then
+    printf "%s-%s" "$first" "$last"
+  else
+    printf "%s" "$first"
+  fi
+}
+
+get_next_iperf_port() {
+  local last_idx="${1:--1}"
+  local n="${#IPERF_PORTS[@]}"
+  (( n > 0 )) || { echo ""; return 1; }
+  local idx=$(( (last_idx + 1) % n ))
+  echo "${IPERF_PORTS[$idx]}:$idx"
+}
+
+print_metadata_info() {
+  have curl || return 0
+
+  local resp server_ip city region country org asn network
+  resp="$(curl -fsS --connect-timeout 1 --max-time 2 https://ipinfo.io/json 2>/dev/null || true)"
+  [[ -n "$resp" ]] || return 0
+
+  if have jq; then
+    server_ip="$(printf '%s' "$resp" | jq -r '.ip // empty' 2>/dev/null || true)"
+    city="$(printf '%s' "$resp" | jq -r '.city // empty' 2>/dev/null || true)"
+    region="$(printf '%s' "$resp" | jq -r '.region // empty' 2>/dev/null || true)"
+    country="$(printf '%s' "$resp" | jq -r '.country // empty' 2>/dev/null || true)"
+    org="$(printf '%s' "$resp" | jq -r '.org // empty' 2>/dev/null || true)"
+  else
+    server_ip="$(printf '%s\n' "$resp" | sed -n 's/.*"ip"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    city="$(printf '%s\n' "$resp" | sed -n 's/.*"city"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    region="$(printf '%s\n' "$resp" | sed -n 's/.*"region"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    country="$(printf '%s\n' "$resp" | sed -n 's/.*"country"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    org="$(printf '%s\n' "$resp" | sed -n 's/.*"org"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  fi
+
+  [[ -n "$server_ip$city$region$country$org" ]] || return 0
+
+  asn="${org%% *}"
+  network="${org#* }"
+  [[ "$network" == "$org" ]] && network=""
+
+  printf "%s\n" "${C_DIM}┌─ Node info ─────────────────────────────────────────────${C_RESET}"
+  [[ -n "$server_ip" ]] && printf "%s\n" "${C_DIM}│ Server IP : ${server_ip}${C_RESET}"
+  if [[ -n "$city$region$country" ]]; then
+    printf "%s\n" "${C_DIM}│ Location  : ${city}${city:+, }${region}${region:+, }${country}${C_RESET}"
+  fi
+  if [[ -n "$org" ]]; then
+    printf "%s\n" "${C_DIM}│ Network   : ${network:-$org}${asn:+ (}$asn${asn:+)}${C_RESET}"
+  fi
+  printf "%s\n" "${C_DIM}└────────────────────────────────────────────────────────${C_RESET}"
+}
+
 
 translate_missing() {
   local bin="$1" hint="$2"
@@ -406,17 +531,22 @@ show_params() {
     rev_label="no"
   fi
 
+  local ports_label
+  ports_label="$(iperf_ports_label)"
+
   printf "\n%s\n" "${C_DIM}Parameters:${C_RESET}"
   printf "%s\n" "${C_DIM}- host: ${HOST:-n/a}${C_RESET}"
   printf "%s\n" "${C_DIM}- sni:  ${SNI:-none}${C_RESET}"
-  printf "%s\n" "${C_DIM}- ports: tcp_echo=$TCP_ECHO_PORT udp_echo=$UDP_ECHO_PORT tls=$TLS_PORT iperf3=$IPERF_PORT${C_RESET}"
+  printf "%s\n" "${C_DIM}- ports: tcp_echo=$TCP_ECHO_PORT udp_echo=$UDP_ECHO_PORT tls=$TLS_PORT iperf3=$ports_label${C_RESET}"
   printf "%s\n" "${C_DIM}- ping:  count=$PING_COUNT timeout=${PING_TIMEOUT}s${C_RESET}"
   printf "%s\n" "${C_DIM}- tcp connect: tries=$TCP_CONNECT_TRIES timeout=${TCP_CONNECT_TIMEOUT}s${C_RESET}"
-  printf "%s\n" "${C_DIM}- iperf3: time=${IPERF_TIME}s parallel=$IPERF_PARALLEL udp_bw=$IPERF_UDP_BW${C_RESET}"
+  printf "%s\n" "${C_DIM}- iperf3 tcp: time=${IPERF_TCP_TIME}s parallel=${IPERF_TCP_PARALLEL} fallback_parallel=${IPERF_TCP_FALLBACK_PARALLEL}${C_RESET}"
+  printf "%s\n" "${C_DIM}- iperf3 udp: time=${IPERF_UDP_TIME}s bw=${IPERF_UDP_BW} fallback_bw=${IPERF_UDP_FALLBACK_BW}${C_RESET}"
   printf "%s\n" "${C_DIM}- iperf3 reverse: ${rev_label}${C_RESET}"
-  printf "%s\n" "${C_DIM}- iperf3 server: timeout=${SERVER_IPERF_TIMEOUT}s${C_RESET}"
+  printf "%s\n" "${C_DIM}- iperf3 server: timeout=${SERVER_IPERF_TIMEOUT}s kill_after=${SERVER_IPERF_KILL_TIMEOUT}s rcv_timeout=${IPERF_RCV_TIMEOUT_MS}ms${C_RESET}"
   printf "%s\n" "${C_DIM}- soak: loops=$SOAK_LOOPS interval=${SOAK_INTERVAL}s timeout=${SOAK_TIMEOUT}s${C_RESET}"
 }
+
 
 # -----------------------------
 # Server listeners
@@ -495,31 +625,30 @@ start_tls_server() {
 
 start_iperf_server() {
   if ! have iperf3; then return 1; fi
-  # If the system lacks the coreutils timeout(1), fall back to a
-  # simple always-on server (no watchdog) and warn once.
-  if ! have timeout; then
-    err "timeout(1) not found; iperf3 watchdog disabled, running iperf3 -s without timeout."
-    iperf3 -s -p "$IPERF_PORT" >/dev/null 2>&1 &
-    PIDS+=("$!")
-    return 0
+
+  local p
+  local rcv_args=()
+  if [[ "${IPERF_HAS_RCV_TIMEOUT:-0}" -eq 1 ]]; then
+    rcv_args=(--rcv-timeout "$IPERF_RCV_TIMEOUT_MS")
   fi
 
-  log "iperf3 watchdog enabled: one-test mode (-1), timeout=${SERVER_IPERF_TIMEOUT}s, port=$IPERF_PORT"
-
-  # Watchdog loop: each child iperf3 handles a single test (-1) and is
-  # wrapped in timeout(1) so a stalled client can never keep the server
-  # process (and port) busy forever. The outer loop is tracked via PIDS[]
-  # and will be killed cleanly on Ctrl+C via cleanup().
-  (
-    set +e
-    while true; do
-      timeout "$SERVER_IPERF_TIMEOUT" iperf3 -s -1 -p "$IPERF_PORT" >/dev/null 2>&1
-      sleep 0.2
-    done
-  ) &
-  PIDS+=("$!")
+  for p in "${IPERF_PORTS[@]}"; do
+    (
+      set +e
+      while true; do
+        if have timeout; then
+          timeout -k "$SERVER_IPERF_KILL_TIMEOUT" "$SERVER_IPERF_TIMEOUT"             iperf3 -s -1 -p "$p" "${rcv_args[@]}" >/dev/null 2>&1
+        else
+          iperf3 -s -1 -p "$p" "${rcv_args[@]}" >/dev/null 2>&1
+        fi
+        sleep 0.2
+      done
+    ) &
+    PIDS+=("$!")
+  done
   return 0
 }
+
 
 server_mode() {
   if [[ "$SUITE" == "custom" ]]; then
@@ -534,7 +663,7 @@ server_mode() {
   log "TCP echo: $BIND_ADDR:$TCP_ECHO_PORT"
   log "UDP echo: $BIND_ADDR:$UDP_ECHO_PORT"
   log "TLS:      $BIND_ADDR:$TLS_PORT (self-signed)"
-  log "iperf3:   $BIND_ADDR:$IPERF_PORT"
+  log "iperf3:   $BIND_ADDR:$(iperf_ports_label)"
   log "Press Ctrl+C to stop"
 
   start_tcp_echo   || err "TCP echo listener not started (need socat, nc, or python3)."
@@ -786,85 +915,129 @@ to_kbits() {
   }'
 }
 
+
+run_iperf_client_on_port() {
+  local label="$1"; shift
+  local timeout_s="$1"; shift
+  local port="$1"; shift
+  if run_with_spinner "$label" timeout "$timeout_s" iperf3 -c "$HOST" -p "$port" "$@"; then
+    return 0
+  fi
+  return $?
+}
+
+is_iperf_rotatable_err() {
+  local code="$1"
+  case "$code" in
+    CONN_REFUSED|TIMEOUT|IPERF_BUSY|IPERF_CONTROL) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+firewall_preflight_iperf_tcp() {
+  if ! have nc; then return 0; fi
+  local p
+  for p in "${IPERF_PORTS[@]}"; do
+    timeout 0.5 nc -z "$HOST" "$p" >/dev/null 2>&1 && return 0
+  done
+  printf "%s\n" "${C_YELLOW}WARNING${C_RESET}: None of the iperf TCP ports ($(iperf_ports_label)) are reachable. Make sure TCP/UDP ports are open on the server firewall." >&2
+  return 0
+}
+
+
 test_iperf_tcp() {
   if ! have iperf3; then
     add_row "iperf3_tcp" "$(warn)" "$(translate_missing iperf3 "apt install iperf3")"
     return
   fi
 
-  local rc=0
+  firewall_preflight_iperf_tcp
+
+  local rev_arg=()
+  [[ "${IPERF_REVERSE:-0}" -eq 1 ]] && rev_arg=(-R)
+
+  local timeout_s=$((IPERF_TCP_TIME + 6))
+  local attempts=$(( ${#IPERF_PORTS[@]} * 2 ))
+  local attempt portinfo port idx rc raw norm code
   local used_fallback=""
-  local timeout_s=$((IPERF_TIME + 10))
-   local rev_arg=()
-   [[ "${IPERF_REVERSE:-0}" -eq 1 ]] && rev_arg=(-R)
+  local val unit kbps
+  local last_idx=-1
 
-  # Attempt 1: use configured parallel
-  if run_with_spinner "iperf3_tcp" timeout "$timeout_s" iperf3 -c "$HOST" -p "$IPERF_PORT" -t "$IPERF_TIME" -P "$IPERF_PARALLEL" "${rev_arg[@]}"; then
-    rc=0
-  else
-    rc=$?
-  fi
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    portinfo="$(get_next_iperf_port "$last_idx")" || break
+    port="${portinfo%%:*}"
+    idx="${portinfo##*:}"
+    last_idx="$idx"
 
-  # If failed and parallel is not 1, retry once with P=1
-  if [[ "$rc" -ne 0 && "${IPERF_PARALLEL:-1}" -ne 1 ]]; then
-    used_fallback="fallback P=1"
-    if run_with_spinner "iperf3_tcp" timeout "$timeout_s" iperf3 -c "$HOST" -p "$IPERF_PORT" -t "$IPERF_TIME" -P 1 "${rev_arg[@]}"; then
+    if run_iperf_client_on_port "iperf3_tcp" "$timeout_s" "$port" -t "$IPERF_TCP_TIME" -P "$IPERF_TCP_PARALLEL" "${rev_arg[@]}"; then
       rc=0
     else
       rc=$?
     fi
-  fi
 
-  if [[ "$rc" -ne 0 ]]; then
-    local raw=""
-    [[ "$rc" -eq 2 ]] && raw="internal error (temp file)"
-    [[ -z "$raw" ]] && raw="$(extract_iperf_errline "${RUN_ERR_FILE:-}" "${RUN_OUT_FILE:-}")"
-    [[ -z "$raw" ]] && raw="iperf3 failed (rc=$rc)"
-    local msg
-    if [[ "$rc" -eq 124 ]]; then
-      msg="iperf3 timed out (network stalled under load)"
-    else
-      msg="$(pretty_err "$raw")"
+    if [[ "$rc" -ne 0 ]]; then
+      if [[ "$rc" -eq 124 ]]; then
+        continue
+      fi
+      raw="$(extract_iperf_errline "${RUN_ERR_FILE:-}" "${RUN_OUT_FILE:-}")"
+      norm="$(normalize_err_line "$raw")"
+      code="$(classify_net_err "$norm")"
+      if is_iperf_rotatable_err "$code"; then
+        continue
+      fi
+      local msg="$(pretty_err "${raw:-iperf3 failed (rc=$rc)}")"
+      add_row "iperf3_tcp" "$(bad)" "$msg"
+      return
     fi
-    [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
-    add_row "iperf3_tcp" "$(bad)" "$msg"
+
+    local rx=""
+    [[ -f "${RUN_OUT_FILE:-}" ]] && rx=$(parse_iperf_receiver "$RUN_OUT_FILE" 2>/dev/null || true)
+    if [[ -z "$rx" ]]; then
+      add_row "iperf3_tcp" "$(bad)" "receiver line missing"
+      return
+    fi
+
+    val=$(awk '{print $1}' <<< "$rx")
+    unit=$(awk '{print $2}' <<< "$rx")
+
+    if awk -v v="$val" 'BEGIN{exit !(v==0)}'; then
+      portinfo="$(get_next_iperf_port "$last_idx")" || { add_row "iperf3_tcp" "$(bad)" "receiver $rx"; return; }
+      port="${portinfo%%:*}"
+      idx="${portinfo##*:}"
+      last_idx="$idx"
+      used_fallback="fallback P=${IPERF_TCP_FALLBACK_PARALLEL}"
+
+      if run_iperf_client_on_port "iperf3_tcp" "$timeout_s" "$port" -t "$IPERF_TCP_TIME" -P "$IPERF_TCP_FALLBACK_PARALLEL" "${rev_arg[@]}"; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [[ "$rc" -ne 0 ]]; then
+        raw="$(extract_iperf_errline "${RUN_ERR_FILE:-}" "${RUN_OUT_FILE:-}")"
+        add_row "iperf3_tcp" "$(bad)" "$(pretty_err "${raw:-iperf3 failed (rc=$rc)}") ($used_fallback)"
+        return
+      fi
+
+      rx=""
+      [[ -f "${RUN_OUT_FILE:-}" ]] && rx=$(parse_iperf_receiver "$RUN_OUT_FILE" 2>/dev/null || true)
+      [[ -n "$rx" ]] || { add_row "iperf3_tcp" "$(bad)" "receiver line missing ($used_fallback)"; return; }
+      val=$(awk '{print $1}' <<< "$rx")
+      unit=$(awk '{print $2}' <<< "$rx")
+      awk -v v="$val" 'BEGIN{exit !(v==0)}' && { add_row "iperf3_tcp" "$(bad)" "receiver $rx ($used_fallback)"; return; }
+    fi
+
+    kbps=$(to_kbits "$val" "$unit" || true)
+    if [[ -n "$kbps" ]] && awk -v k="$kbps" 'BEGIN{exit !(k<1000)}'; then
+      add_row "iperf3_tcp" "$(warn)" "receiver $rx${used_fallback:+ ($used_fallback)} (< 1 Mbps)"
+    else
+      add_row "iperf3_tcp" "$(ok)" "receiver $rx${used_fallback:+ ($used_fallback)}"
+    fi
     return
-  fi
+  done
 
-  local rx=""
-  [[ -f "${RUN_OUT_FILE:-}" ]] && rx=$(parse_iperf_receiver "$RUN_OUT_FILE" 2>/dev/null || true)
-  if [[ -z "$rx" ]]; then
-    local msg="receiver line missing"
-    [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
-    add_row "iperf3_tcp" "$(bad)" "$msg"
-    return
-  fi
-
-  local val unit
-  val=$(awk '{print $1}' <<< "$rx")
-  unit=$(awk '{print $2}' <<< "$rx")
-
-  # FAIL if exactly zero, WARN if below 1 Mbit/sec (1000 Kbits/sec)
-  local kbps; kbps=$(to_kbits "$val" "$unit" || true)
-
-  if awk -v v="$val" 'BEGIN{exit !(v==0)}'; then
-    local msg="receiver $rx"
-    [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
-    add_row "iperf3_tcp" "$(bad)" "$msg"
-    return
-  fi
-
-  if [[ -n "$kbps" ]] && awk -v k="$kbps" 'BEGIN{exit !(k<1000)}'; then
-    local msg="receiver $rx (< 1 Mbps)"
-    [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
-    add_row "iperf3_tcp" "$(warn)" "$msg"
-    return
-  fi
-
-  local msg="receiver $rx"
-  [[ -n "$used_fallback" ]] && msg="$msg ($used_fallback)"
-  add_row "iperf3_tcp" "$(ok)" "$msg"
+  add_row "iperf3_tcp" "$(bad)" "all iperf3 ports failed"
 }
+
 
 test_iperf_udp() {
   if ! have iperf3; then
@@ -872,97 +1045,86 @@ test_iperf_udp() {
     return
   fi
 
-  local rc=0
-  local msg=""
-  local used_fallback=""
-  local timeout_s=$((IPERF_TIME + 10))
   local rev_arg=()
   [[ "${IPERF_REVERSE:-0}" -eq 1 ]] && rev_arg=(-R)
 
-  local attempt backoff
-  for attempt in 1 2 3 4; do
-    if run_with_spinner "iperf3_udp" timeout "$timeout_s" iperf3 -u -c "$HOST" -p "$IPERF_PORT" -t "$IPERF_TIME" -b "$IPERF_UDP_BW" "${rev_arg[@]}"; then
+  local timeout_s=$((IPERF_UDP_TIME + 6))
+  local attempts=$(( ${#IPERF_PORTS[@]} * 2 ))
+  local attempt portinfo port idx rc msg raw norm code sum
+  local used_fallback=""
+  local last_idx=-1
+
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    portinfo="$(get_next_iperf_port "$last_idx")" || break
+    port="${portinfo%%:*}"
+    idx="${portinfo##*:}"
+    last_idx="$idx"
+
+    if run_iperf_client_on_port "iperf3_udp" "$timeout_s" "$port" -u -t "$IPERF_UDP_TIME" -b "$IPERF_UDP_BW" "${rev_arg[@]}"; then
       rc=0
     else
       rc=$?
     fi
 
-    msg="$(extract_iperf_errline "${RUN_ERR_FILE:-}" "${RUN_OUT_FILE:-}")"
+    if [[ "$rc" -ne 0 ]]; then
+      if [[ "$rc" -eq 124 ]]; then
+        continue
+      fi
+      raw="$(extract_iperf_errline "${RUN_ERR_FILE:-}" "${RUN_OUT_FILE:-}")"
+      norm="$(normalize_err_line "$raw")"
+      code="$(classify_net_err "$norm")"
+      if is_iperf_rotatable_err "$code"; then
+        continue
+      fi
 
-    if [[ "$rc" -ne 0 ]] && is_iperf_busy "$msg"; then
-      backoff=$((attempt))  # 1s,2s,3s,4s
-      log "iperf3 server busy, retrying in ${backoff}s (attempt ${attempt}/4)"
-      sleep "$backoff"
-      continue
+      if [[ "${IPERF_UDP_BW:-}" != "${IPERF_UDP_FALLBACK_BW:-}" ]]; then
+        used_fallback="fallback bw=${IPERF_UDP_FALLBACK_BW}"
+        if run_iperf_client_on_port "iperf3_udp" "$timeout_s" "$port" -u -t "$IPERF_UDP_TIME" -b "$IPERF_UDP_FALLBACK_BW" "${rev_arg[@]}"; then
+          rc=0
+        else
+          rc=$?
+        fi
+      fi
+
+      if [[ "$rc" -ne 0 ]]; then
+        msg="$(pretty_err "${raw:-iperf3 failed (rc=$rc)}")"
+        add_row "iperf3_udp" "$(bad)" "$msg${used_fallback:+ ($used_fallback)}"
+        return
+      fi
     fi
 
-    break
+    sum=""
+    [[ -f "${RUN_OUT_FILE:-}" ]] && sum=$(awk '/receiver/ && /%/ {print; exit}' "$RUN_OUT_FILE" 2>/dev/null || true)
+    if [[ -z "$sum" ]]; then
+      add_row "iperf3_udp" "$(bad)" "receiver summary missing${used_fallback:+ ($used_fallback)}"
+      return
+    fi
+
+    local rate jitter loss pct
+    rate=$(awk '{for(i=1;i<=NF;i++) if($i ~ /bits\/sec/) {print $(i-1), $i; exit}}' <<< "$sum")
+    jitter=$(awk '{for(i=1;i<=NF;i++) if($i=="ms") {print $(i-1), "ms"; exit}}' <<< "$sum")
+    loss=$(awk 'match($0, /[0-9]+\/[0-9]+ \([0-9.]+%\)/, a){print a[0]; exit}' <<< "$sum")
+    pct=$(awk 'match($0, /\(([0-9.]+)%\)/, a){print a[1]; exit}' <<< "${loss:-}")
+
+    if [[ -z "$pct" ]]; then
+      add_row "iperf3_udp" "$(warn)" "$rate, summary incomplete${used_fallback:+ ($used_fallback)}"
+      return
+    fi
+
+    local d="$rate, loss $loss, jitter $jitter${used_fallback:+ ($used_fallback)}"
+    if awk -v p="$pct" 'BEGIN{exit !(p<=1.0)}'; then
+      add_row "iperf3_udp" "$(ok)" "$d"
+    elif awk -v p="$pct" 'BEGIN{exit !(p<=3.0)}'; then
+      add_row "iperf3_udp" "$(warn)" "$d"
+    else
+      add_row "iperf3_udp" "$(bad)" "$d"
+    fi
+    return
   done
 
-  # If still failed (and not busy), retry once with low bandwidth
-  if [[ "$rc" -ne 0 ]] && ! is_iperf_busy "$msg" && [[ "${IPERF_UDP_BW:-}" != "1M" ]]; then
-    used_fallback="fallback bw=1M"
-    if run_with_spinner "iperf3_udp" timeout "$timeout_s" iperf3 -u -c "$HOST" -p "$IPERF_PORT" -t "$IPERF_TIME" -b 1M "${rev_arg[@]}"; then
-      rc=0
-      msg=""
-    else
-      rc=$?
-      msg="$(extract_iperf_errline "${RUN_ERR_FILE:-}" "${RUN_OUT_FILE:-}")"
-    fi
-  fi
-
-  if [[ "$rc" -ne 0 ]]; then
-    local raw=""
-    [[ "$rc" -eq 2 ]] && raw="internal error (temp file)"
-    [[ -z "$raw" ]] && raw="$msg"
-    [[ -z "$raw" ]] && raw="iperf3 failed (rc=$rc)"
-
-    local outmsg
-    if [[ "$rc" -eq 124 ]]; then
-      outmsg="iperf3 timed out (network stalled under load)"
-    else
-      outmsg="$(pretty_err "$raw")"
-    fi
-
-    [[ -n "$used_fallback" ]] && outmsg="$outmsg ($used_fallback)"
-    add_row "iperf3_udp" "$(bad)" "$outmsg"
-    return
-  fi
-
-  local sum=""
-  [[ -f "${RUN_OUT_FILE:-}" ]] && sum=$(awk '/receiver/ && /%/ {print; exit}' "$RUN_OUT_FILE" 2>/dev/null || true)
-  if [[ -z "$sum" ]]; then
-    local d="receiver summary missing"
-    [[ -n "$used_fallback" ]] && d="$d ($used_fallback)"
-    add_row "iperf3_udp" "$(bad)" "$d"
-    return
-  fi
-
-  local rate jitter loss pct
-  rate=$(awk '{for(i=1;i<=NF;i++) if($i ~ /bits\/sec/) {print $(i-1), $i; exit}}' <<< "$sum")
-  jitter=$(awk '{for(i=1;i<=NF;i++) if($i=="ms") {print $(i-1), "ms"; exit}}' <<< "$sum")
-
-  loss=$(awk 'match($0, /[0-9]+\/[0-9]+ \([0-9.]+%\)/, a){print a[0]; exit}' <<< "$sum")
-  pct=$(awk 'match($0, /\(([0-9.]+)%\)/, a){print a[1]; exit}' <<< "${loss:-}")
-
-  if [[ -z "$pct" ]]; then
-    local d="$rate, summary incomplete"
-    [[ -n "$used_fallback" ]] && d="$d ($used_fallback)"
-    add_row "iperf3_udp" "$(warn)" "$d"
-    return
-  fi
-
-  local d="$rate, loss $loss, jitter $jitter"
-  [[ -n "$used_fallback" ]] && d="$d ($used_fallback)"
-
-  if awk -v p="$pct" 'BEGIN{exit !(p<=1.0)}'; then
-    add_row "iperf3_udp" "$(ok)" "$d"
-  elif awk -v p="$pct" 'BEGIN{exit !(p<=3.0)}'; then
-    add_row "iperf3_udp" "$(warn)" "$d"
-  else
-    add_row "iperf3_udp" "$(bad)" "$d"
-  fi
+  add_row "iperf3_udp" "$(bad)" "all iperf3 ports failed"
 }
+
 
 soak_progress_line() {
   # label, attempt, total, drops
@@ -1034,9 +1196,6 @@ run_suite_client_single_host() {
       run_one test_udp_echo
       run_one test_tls_handshake
       run_one test_iperf_tcp
-      # Small gap to let iperf3 server fully tear down and watchdog
-      # spin up a fresh one before switching from TCP to UDP.
-      sleep 1 || true
       run_one test_iperf_udp
       run_one test_tcp_soak
       run_one test_tls_soak
@@ -1050,9 +1209,6 @@ run_suite_client_single_host() {
       ;;
     throughput)
       run_one test_iperf_tcp
-      # Same small delay between TCP and UDP when running throughput suite
-      # to avoid transient \"server busy\" from just-finished TCP sessions.
-      sleep 1 || true
       run_one test_iperf_udp
       ;;
     soak)
@@ -1114,6 +1270,7 @@ EOF
   printf "%s\n" "Version ${C_YELLOW}${VERSION}${C_RESET}"
   printf "%s\n" "Github ${C_YELLOW}github.com/ehinium/ehiniumNetProbe${C_RESET}"
   printf "%s\n" "By Ehsan ${C_YELLOW}@ehinium${C_RESET}"
+  print_metadata_info
 }
 
 wizard_loop() {
@@ -1194,11 +1351,20 @@ wizard_loop() {
       prompt_line_default "TCP echo port [$TCP_ECHO_PORT]: " "$TCP_ECHO_PORT"; TCP_ECHO_PORT="$PROMPT_VALUE"
       prompt_line_default "UDP echo port [$UDP_ECHO_PORT]: " "$UDP_ECHO_PORT"; UDP_ECHO_PORT="$PROMPT_VALUE"
       prompt_line_default "TLS port [$TLS_PORT]: " "$TLS_PORT"; TLS_PORT="$PROMPT_VALUE"
-      prompt_line_default "iperf3 port [$IPERF_PORT]: " "$IPERF_PORT"; IPERF_PORT="$PROMPT_VALUE"
+      prompt_line_default "iperf3 port base [$IPERF_PORT_BASE]: " "$IPERF_PORT_BASE"; IPERF_PORT_BASE="$PROMPT_VALUE"
+      prompt_line_default "iperf3 port count [$IPERF_PORT_COUNT]: " "$IPERF_PORT_COUNT"; IPERF_PORT_COUNT="$PROMPT_VALUE"
+      prompt_line_default "iperf3 explicit ports CSV [$IPERF_PORTS_CSV]: " "$IPERF_PORTS_CSV"; IPERF_PORTS_CSV="$PROMPT_VALUE"
+      prompt_line_default "iperf3 TCP duration seconds [$IPERF_TCP_TIME]: " "$IPERF_TCP_TIME"; IPERF_TCP_TIME="$PROMPT_VALUE"
+      prompt_line_default "iperf3 TCP parallel [$IPERF_TCP_PARALLEL]: " "$IPERF_TCP_PARALLEL"; IPERF_TCP_PARALLEL="$PROMPT_VALUE"
+      prompt_line_default "iperf3 TCP fallback parallel [$IPERF_TCP_FALLBACK_PARALLEL]: " "$IPERF_TCP_FALLBACK_PARALLEL"; IPERF_TCP_FALLBACK_PARALLEL="$PROMPT_VALUE"
+      prompt_line_default "iperf3 UDP duration seconds [$IPERF_UDP_TIME]: " "$IPERF_UDP_TIME"; IPERF_UDP_TIME="$PROMPT_VALUE"
+      prompt_line_default "iperf3 UDP bandwidth [$IPERF_UDP_BW]: " "$IPERF_UDP_BW"; IPERF_UDP_BW="$PROMPT_VALUE"
+      prompt_line_default "iperf3 UDP fallback bandwidth [$IPERF_UDP_FALLBACK_BW]: " "$IPERF_UDP_FALLBACK_BW"; IPERF_UDP_FALLBACK_BW="$PROMPT_VALUE"
       prompt_line_default "iperf3 server timeout seconds [$SERVER_IPERF_TIMEOUT]: " "$SERVER_IPERF_TIMEOUT"; SERVER_IPERF_TIMEOUT="$PROMPT_VALUE"
+      prompt_line_default "iperf3 server kill timeout seconds [$SERVER_IPERF_KILL_TIMEOUT]: " "$SERVER_IPERF_KILL_TIMEOUT"; SERVER_IPERF_KILL_TIMEOUT="$PROMPT_VALUE"
+      prompt_line_default "iperf3 rcv-timeout milliseconds [$IPERF_RCV_TIMEOUT_MS]: " "$IPERF_RCV_TIMEOUT_MS"; IPERF_RCV_TIMEOUT_MS="$PROMPT_VALUE"
       prompt_line_default "Soak loops [$SOAK_LOOPS]: " "$SOAK_LOOPS"; SOAK_LOOPS="$PROMPT_VALUE"
       prompt_line_default "Soak interval seconds [$SOAK_INTERVAL]: " "$SOAK_INTERVAL"; SOAK_INTERVAL="$PROMPT_VALUE"
-      prompt_line_default "iperf3 UDP bandwidth [$IPERF_UDP_BW]: " "$IPERF_UDP_BW"; IPERF_UDP_BW="$PROMPT_VALUE"
 
       prompt_choice "Output format:" "Terminal table" "Markdown table"
       OUTPUT_FORMAT=$([[ "$CHOICE_INDEX" -eq 1 ]] && echo "markdown" || echo "terminal")
@@ -1214,6 +1380,8 @@ wizard_loop() {
       OUTPUT_FORMAT="terminal"
       TSV_OUT=""
     fi
+
+    setup_iperf_ports
 
     if [[ "$MODE" == "server" ]]; then
       server_mode
@@ -1234,8 +1402,14 @@ Usage:
   $0                (interactive)
   $0 --interactive  (interactive)
 
-  $0 server --suite baseline|throughput|soak|express|custom [--iperf-server-timeout <sec>]
-  $0 client --suite baseline|throughput|soak|express|custom --host <ip|domain> [--sni <name>] [--iperf-reverse]
+  $0 server --suite baseline|throughput|soak|express|custom [flags...]
+  $0 client --suite baseline|throughput|soak|express|custom --host <ip|domain> [--sni <name>] [--iperf-reverse] [flags...]
+
+iperf flags:
+  --iperf-port-base <port> | --iperf-port-count <n> | --iperf-ports <csv>
+  --iperf-tcp-time <sec> --iperf-tcp-parallel <n> --iperf-tcp-fallback-parallel <n>
+  --iperf-udp-time <sec> --iperf-udp-bw <rate> --iperf-udp-fallback-bw <rate>
+  --iperf-server-timeout <sec> --iperf-server-kill-timeout <sec> --iperf-rcv-timeout-ms <ms>
 
 Custom-only:
   --format terminal|markdown
@@ -1249,7 +1423,10 @@ parse_args() {
     usage; exit 0
   fi
 
+  apply_env_overrides
   ensure_dependencies
+  setup_iperf_capabilities
+  setup_iperf_ports
   if [[ $# -eq 0 ]]; then wizard_loop; exit 0; fi
   if [[ "${1:-}" == "--interactive" || "${1:-}" == "-i" ]]; then wizard_loop; exit 0; fi
 
@@ -1262,7 +1439,18 @@ parse_args() {
       --host) HOST="${2:-}"; shift 2 ;;
       --sni)  SNI="${2:-}"; shift 2 ;;
       --iperf-reverse|--reverse) IPERF_REVERSE=1; shift ;;
+      --iperf-port-base) IPERF_PORT_BASE="${2:-}"; shift 2 ;;
+      --iperf-port-count) IPERF_PORT_COUNT="${2:-}"; shift 2 ;;
+      --iperf-ports) IPERF_PORTS_CSV="${2:-}"; shift 2 ;;
+      --iperf-tcp-parallel) IPERF_TCP_PARALLEL="${2:-}"; shift 2 ;;
+      --iperf-tcp-fallback-parallel) IPERF_TCP_FALLBACK_PARALLEL="${2:-}"; shift 2 ;;
+      --iperf-tcp-time) IPERF_TCP_TIME="${2:-}"; shift 2 ;;
+      --iperf-udp-bw) IPERF_UDP_BW="${2:-}"; shift 2 ;;
+      --iperf-udp-fallback-bw) IPERF_UDP_FALLBACK_BW="${2:-}"; shift 2 ;;
+      --iperf-udp-time) IPERF_UDP_TIME="${2:-}"; shift 2 ;;
       --iperf-server-timeout) SERVER_IPERF_TIMEOUT="${2:-}"; shift 2 ;;
+      --iperf-server-kill-timeout) SERVER_IPERF_KILL_TIMEOUT="${2:-}"; shift 2 ;;
+      --iperf-rcv-timeout-ms) IPERF_RCV_TIMEOUT_MS="${2:-}"; shift 2 ;;
       --format) OUTPUT_FORMAT="${2:-terminal}"; shift 2 ;;
       --tsv) TSV_OUT="${2:-}"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
@@ -1270,6 +1458,7 @@ parse_args() {
     esac
   done
 
+  setup_iperf_ports
   if [[ "$SUITE" != "custom" ]]; then OUTPUT_FORMAT="terminal"; TSV_OUT=""; fi
 
   if [[ "$MODE" == "client" ]]; then
